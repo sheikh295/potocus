@@ -1,0 +1,26 @@
+# Potocus global (non-secret) settings.
+# Secrets (API keys, tokens) belong in .env — never here.
+
+ollama:
+  # OpenAI-compatible base URL. Override with POTOCUS_OLLAMA_BASE_URL.
+  base_url: http://127.0.0.1:11434/v1
+  # Native Ollama API (used for /api/tags health checks).
+  native_url: http://127.0.0.1:11434
+  timeout_seconds: 120
+
+models:
+  orchestrator: qwen3:8b
+  specialist: hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q4_K_M
+  temperature: 0.2
+  # Cap specialist consults per orchestrator tool-call turn (§2.2).
+  specialist_calls_per_turn: 1
+
+defaults:
+  pacing: normal  # stealth | normal | aggressive
+  output_dir: ./reports
+
+# Active context pointers (updated by `workspace switch` / `session` commands).
+# Paths are absolute or relative to the machine running the harness.
+active:
+  workspace: null
+  session: null
