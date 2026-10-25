@@ -60,8 +60,10 @@ potocus workspace init ./clientX-pentest --mode scoped
 potocus scope add 10.10.20.0/24 --note "corp-vlan per ROE"
 potocus scope check -- nmap -sn 10.10.20.5
 potocus config classify -- nmap -sV 10.10.20.5
+potocus config consult "What does CVE mean in one sentence?" --twice
 potocus session new --name "external-recon"
 potocus chat
+# inside chat: /expert <question>  → consult_security_expert (1/turn)
 ```
 
 ## CLI
@@ -71,9 +73,9 @@ potocus chat
 | `potocus workspace` | init / switch / show / set-mode |
 | `potocus scope` | add / remove / list / check |
 | `potocus session` | new / list / resume / rename / close / set-phase |
-| `potocus chat` | live orchestrator REPL (Ollama) |
+| `potocus chat` | LangGraph ReAct REPL (checkpointed per session) |
 | `potocus status` | workspace / session / phase / mode |
-| `potocus config` | show / test-ollama / classify |
+| `potocus config` | show / test-ollama / classify / consult |
 
 ## Tests
 

@@ -19,6 +19,11 @@ defaults:
   pacing: normal  # stealth | normal | aggressive
   output_dir: ./reports
 
+agent:
+  # Approximate token ceiling before the compact node summarizes older turns (§10).
+  context_token_limit: 8000
+  keep_recent_messages: 8
+
 # Active context pointers (updated by `workspace switch` / `session` commands).
 # Paths are absolute or relative to the machine running the harness.
 active:

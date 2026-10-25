@@ -1,4 +1,4 @@
-"""``potocus chat`` — interactive orchestrator REPL against local Ollama."""
+"""``potocus chat`` — LangGraph ReAct REPL for the active session."""
 
 from __future__ import annotations
 
@@ -6,15 +6,15 @@ from typing import Any
 
 import typer
 import yaml
-from openai import OpenAI
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from src.models import get_model_endpoints, get_openai_client
-from src.prompts import ORCHESTRATOR_SYSTEM_PROMPT
+from src.graph import PotocusAgent, create_agent
+from src.tools.expert import TOOL_NAME
 from src.utils.config import (
     GLOBAL_STATE_DIR,
     get_active_session_id,
@@ -38,35 +38,63 @@ def _load_session_meta(workspace, session_id: str) -> dict[str, Any]:
     return data
 
 
-def _chat_once(
-    client: OpenAI,
-    *,
-    model: str,
-    temperature: float,
-    messages: list[dict[str, str]],
-) -> str:
-    """Send one chat turn to the orchestrator and return assistant text."""
-    completion = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        extra_body={"think": False},
-    )
-    message = completion.choices[0].message
-    content = (message.content or "").strip()
-    if not content:
-        reasoning = getattr(message, "reasoning", None) or ""
-        content = str(reasoning).strip()
-    return content
+def _save_session_phase(workspace, session_id: str, phase: str) -> None:
+    """Persist phase changes back to session.yaml."""
+    path = workspace.sessions_dir / session_id / "session.yaml"
+    meta = _load_session_meta(workspace, session_id)
+    meta["phase"] = phase
+    with path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(meta, handle, default_flow_style=False, sort_keys=False)
+
+
+def _print_turn(agent: PotocusAgent, state: dict[str, Any], user_text: str) -> None:
+    """Render tool calls and the final assistant reply for this turn."""
+    messages = list(state.get("messages") or [])
+    # Walk backward to the HumanMessage for this turn, then print what followed.
+    start = 0
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, HumanMessage) and msg.content == user_text:
+            start = idx + 1
+            break
+
+    for msg in messages[start:]:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for call in msg.tool_calls:
+                name = call.get("name", "tool")
+                args = call.get("args", {})
+                console.print(
+                    Panel.fit(
+                        f"[bold]{name}[/bold]\n{args}",
+                        title="tool call",
+                        border_style="cyan",
+                    )
+                )
+        elif isinstance(msg, ToolMessage):
+            border = "yellow" if "BUDGET_EXCEEDED" in (msg.content or "") else "magenta"
+            console.print(
+                Panel(
+                    Markdown(str(msg.content)),
+                    title=f"tool result · {msg.name or TOOL_NAME}",
+                    border_style=border,
+                )
+            )
+
+    reply = agent.latest_ai_text(state)  # type: ignore[arg-type]
+    if reply:
+        console.print()
+        console.print(Markdown(reply))
+        console.print()
+    else:
+        console.print("[yellow]No final assistant message in this turn.[/yellow]")
 
 
 @app.callback(invoke_without_command=True)
 def chat(ctx: typer.Context) -> None:
     """
-    Start a real orchestrator chat loop for the active workspace/session.
+    Start the Potocus LangGraph ReAct loop for the active workspace/session.
 
-    Tool calling and HITL interrupt flow wire in with the LangGraph engine;
-    this REPL already talks to your live local models with full session context.
+    State is checkpointed under ``.potocus/sessions/<id>/checkpoints/``.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -96,78 +124,81 @@ def chat(ctx: typer.Context) -> None:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    endpoints = get_model_endpoints()
-    # Prefer workspace model overrides when present.
-    model = workspace.models.get("orchestrator") or endpoints.orchestrator
-    client = get_openai_client()
+    phase = str(meta.get("phase") or "RECON")
+    agent = create_agent(workspace, session_id=session_id, phase=phase)
 
     mode_style = "bold red" if workspace.mode == "scoped" else "bold yellow"
     console.print(
         Panel.fit(
             f"[{mode_style}]{workspace.mode.upper()}[/{mode_style}]  "
             f"{workspace.name}  ·  session {meta.get('name', session_id)} ({session_id})\n"
-            f"phase: {meta.get('phase', 'RECON')}  ·  model: {model}\n"
-            "[dim]Type a message. Commands: /exit  /clear  /status[/dim]",
-            title="Potocus Chat",
+            f"phase: {phase}\n"
+            f"orchestrator: {agent.runtime.orchestrator_model}\n"
+            f"specialist:   {agent.runtime.specialist_model}\n"
+            f"context budget: {agent.runtime.context_token_limit} tokens (approx)\n"
+            "[dim]Commands: /exit  /status  /phase <NAME>[/dim]",
+            title="Potocus Chat (LangGraph)",
             border_style="cyan",
         )
     )
 
-    system = (
-        f"{ORCHESTRATOR_SYSTEM_PROMPT}\n\n"
-        f"Workspace: {workspace.name}\n"
-        f"Mode: {workspace.mode}\n"
-        f"Phase: {meta.get('phase', 'RECON')}\n"
-        f"Pacing: {workspace.pacing}\n"
-    )
-    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
-
     GLOBAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
     history_path = GLOBAL_STATE_DIR / "chat_history.txt"
-    session: PromptSession[str] = PromptSession(history=FileHistory(str(history_path)))
+    prompt_session: PromptSession[str] = PromptSession(
+        history=FileHistory(str(history_path))
+    )
 
-    while True:
-        try:
-            user_text = session.prompt("you › ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]Bye.[/dim]")
-            break
+    try:
+        while True:
+            try:
+                user_text = prompt_session.prompt("you › ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Bye.[/dim]")
+                break
 
-        if not user_text:
-            continue
-        if user_text in {"/exit", "/quit", ":q"}:
-            console.print("[dim]Bye.[/dim]")
-            break
-        if user_text == "/clear":
-            messages = [{"role": "system", "content": system}]
-            console.print("[green]Context cleared.[/green]")
-            continue
-        if user_text == "/status":
-            console.print(
-                f"mode={workspace.mode} phase={meta.get('phase')} "
-                f"messages={len(messages)} model={model}"
-            )
-            continue
-
-        messages.append({"role": "user", "content": user_text})
-        try:
-            with console.status("[dim]thinking…[/dim]", spinner="dots"):
-                reply = _chat_once(
-                    client,
-                    model=model,
-                    temperature=endpoints.temperature,
-                    messages=messages,
+            if not user_text:
+                continue
+            if user_text in {"/exit", "/quit", ":q"}:
+                console.print("[dim]Bye.[/dim]")
+                break
+            if user_text == "/status":
+                snap = agent.graph.get_state(agent.config())
+                values = snap.values if snap else {}
+                console.print(
+                    f"mode={workspace.mode} phase={agent.runtime.phase} "
+                    f"tokens≈{values.get('context_tokens_approx', 0)} "
+                    f"specialist_this_turn="
+                    f"{values.get('specialist_calls_this_turn', 0)}/"
+                    f"{agent.runtime.budget.max_calls_per_turn} "
+                    f"cap_hits={agent.runtime.budget.cap_hits} "
+                    f"messages={len(values.get('messages') or [])}"
                 )
-        except Exception as exc:  # noqa: BLE001 — show live API errors to the operator
-            console.print(f"[red]Model error:[/red] {exc}")
-            messages.pop()  # drop the failed user turn
-            continue
+                continue
+            if user_text.startswith("/phase"):
+                parts = user_text.split(maxsplit=1)
+                if len(parts) != 2:
+                    console.print("[yellow]Usage:[/yellow] /phase RECON|ENUMERATION|...")
+                    continue
+                new_phase = parts[1].strip().upper()
+                from src.graph import valid_phases
 
-        if not reply:
-            console.print("[yellow]Empty model response.[/yellow]")
-            continue
+                if new_phase not in valid_phases():
+                    console.print(f"[red]Invalid phase.[/red] Choose from {valid_phases()}")
+                    continue
+                agent.runtime.phase = new_phase
+                _save_session_phase(workspace, session_id, new_phase)
+                # Persist phase into checkpointed state.
+                agent.graph.update_state(agent.config(), {"phase": new_phase})
+                console.print(f"[green]Phase set to[/green] {new_phase}")
+                continue
 
-        messages.append({"role": "assistant", "content": reply})
-        console.print()
-        console.print(Markdown(reply))
-        console.print()
+            try:
+                with console.status("[dim]agent loop…[/dim]", spinner="dots"):
+                    state = agent.invoke_turn(user_text)
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[red]Agent error:[/red] {exc}")
+                continue
+
+            _print_turn(agent, state, user_text)
+    finally:
+        agent.close()

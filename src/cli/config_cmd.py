@@ -8,6 +8,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.models import get_model_endpoints, test_ollama_connection
+from src.tools.expert import TOOL_NAME, consult_security_expert, new_budget_from_config
 from src.tools.risk_classification import classify_command
 from src.utils.config import GLOBAL_CONFIG_PATH, load_global_config
 
@@ -137,3 +138,54 @@ def config_classify(ctx: typer.Context) -> None:
             border_style=color,
         )
     )
+
+
+@app.command("consult")
+def config_consult(
+    query: str = typer.Argument(..., help="Question for the security specialist."),
+    context: str | None = typer.Option(
+        None,
+        "--context",
+        "-c",
+        help="Optional factual context (scan notes, CVE ids).",
+    ),
+    twice: bool = typer.Option(
+        False,
+        "--twice",
+        help="Call twice with the same budget to demonstrate the per-turn cap.",
+    ),
+) -> None:
+    """
+    Call ``consult_security_expert`` against the live Dolphin3-Cyber model.
+
+    Specialist history stays isolated from the orchestrator. Use ``--twice`` to
+    verify the per-turn budget (second call should be capped).
+    """
+    from rich.markdown import Markdown
+
+    budget = new_budget_from_config()
+    endpoints = get_model_endpoints()
+    console.print(
+        f"[dim]{TOOL_NAME} → {endpoints.specialist} "
+        f"(budget {budget.max_calls_per_turn}/turn)[/dim]"
+    )
+
+    def _run(label: str) -> None:
+        with console.status(f"[dim]{label}…[/dim]", spinner="dots"):
+            result = consult_security_expert(query, context=context, budget=budget)
+        border = "yellow" if result.capped else "magenta"
+        console.print(
+            Panel(
+                Markdown(result.answer),
+                title=(
+                    f"{TOOL_NAME} · call {result.calls_this_turn}/"
+                    f"{result.max_calls_per_turn}"
+                    + (" · CAPPED" if result.capped else "")
+                ),
+                border_style=border,
+            )
+        )
+
+    _run("consulting specialist")
+    if twice:
+        _run("second consult (expect cap)")
