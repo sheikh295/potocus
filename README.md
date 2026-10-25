@@ -80,6 +80,7 @@ potocus chat
 | `potocus scope` | add / remove / list / check |
 | `potocus session` | new / list / resume / rename / close / set-phase |
 | `potocus tools` | index / search / status (Kali manuals → ChromaDB) |
+| `potocus findings` | summary / hosts / services / list / search |
 | `potocus chat` | LangGraph ReAct REPL + HITL panels |
 | `potocus status` | workspace / session / phase / mode |
 | `potocus config` | show / test-ollama / classify / consult |

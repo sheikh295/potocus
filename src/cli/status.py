@@ -7,6 +7,7 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 
+from src.memory.findings_db import FindingsDB
 from src.models import get_model_endpoints
 from src.utils.config import get_active_session_id, get_active_workspace_path
 from src.workspace.manager import WorkspaceError, load_workspace
@@ -48,6 +49,14 @@ def status(
                 targets = scope_data.get("targets") or []
                 scope_count = len(targets)
 
+            findings_summary = {"hosts": 0, "services": 0, "findings": 0}
+            try:
+                db = FindingsDB(workspace.findings_db)
+                findings_summary = db.summary()
+                db.close()
+            except Exception:  # noqa: BLE001 — status should still render
+                pass
+
             payload["workspace"] = {
                 "name": workspace.name,
                 "root": str(workspace.root),
@@ -56,6 +65,7 @@ def status(
                 "output_dir": str(workspace.output_dir),
                 "scope_target_count": scope_count,
                 "models": workspace.models,
+                "findings": findings_summary,
             }
 
             if session_id:
@@ -93,6 +103,13 @@ def status(
         table.add_row("pacing", ws["pacing"])
         table.add_row("scope targets", str(ws["scope_target_count"]))
         table.add_row("output_dir", ws["output_dir"])
+        findings = ws.get("findings") or {}
+        table.add_row(
+            "findings.db",
+            f"hosts={findings.get('hosts', 0)} "
+            f"services={findings.get('services', 0)} "
+            f"findings={findings.get('findings', 0)}",
+        )
 
     sess = payload.get("session")
     if not sess:

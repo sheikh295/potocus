@@ -101,8 +101,9 @@ def _ensure_layout(root: Path, mode: Mode, output_dir: Path) -> None:
     (potocus / "vectorstore").mkdir(parents=True, exist_ok=True)
     (potocus / "sessions").mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    (potocus / "findings.db").touch(exist_ok=True)
+    from src.memory.findings_db import FindingsDB
 
+    FindingsDB(potocus / "findings.db").close()
     (potocus / "potocus.log").touch(exist_ok=True)
     if mode == "scoped":
         scope_path = potocus / "scope.yaml"

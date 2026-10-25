@@ -5,7 +5,7 @@ from __future__ import annotations
 import typer
 from rich.console import Console
 
-from src.cli import chat, config_cmd, scope, session, status, tools_cmd, workspace
+from src.cli import chat, config_cmd, findings, scope, session, status, tools_cmd, workspace
 
 app = typer.Typer(
     name="potocus",
@@ -23,6 +23,7 @@ app.add_typer(scope.app, name="scope")
 app.add_typer(session.app, name="session")
 app.add_typer(chat.app, name="chat")
 app.add_typer(tools_cmd.app, name="tools")
+app.add_typer(findings.app, name="findings")
 app.add_typer(status.app, name="status")
 app.add_typer(config_cmd.app, name="config")
 

@@ -34,6 +34,7 @@ from src.tools.expert import (
     SpecialistBudget,
     consult_security_expert,
 )
+from src.memory.findings_db import FindingsDB
 from src.memory.vectorstore import WorkspaceVectorStore
 from src.tools.discovery import (
     TOOL_NAME as SEARCH_TOOLS_NAME,
@@ -43,6 +44,7 @@ from src.tools.terminal import (
     TOOL_NAME as EXECUTE_TOOL_NAME,
     execute_kali_command,
 )
+from src.utils.output_parser import format_parse_for_llm, parse_tool_output
 from src.workspace.manager import EngagementPhase, Workspace
 from src.workspace.scope_guard import ScopeGuard
 
@@ -74,6 +76,7 @@ class GraphRuntime:
     budget: SpecialistBudget
     scope_guard: ScopeGuard
     vectorstore: WorkspaceVectorStore
+    findings_db: FindingsDB
     seen_targets: list[str] = field(default_factory=list)
     tier2_confirmed: bool = False
     context_token_limit: int = 8000
@@ -126,11 +129,15 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
         f"- {SEARCH_TOOLS_NAME}: find the right Kali tool and usage from manuals "
         "(call this when unsure which binary/flags to use).\n"
         f"- {EXECUTE_TOOL_NAME}: run a host CLI command (argv string). "
-        "ScopeGuard + risk HITL gate execution in code.\n"
+        "ScopeGuard + risk HITL gate execution in code. Prefer machine-readable "
+        "flags when available (e.g. nmap -oX -).\n"
+        f"- search_past_engagements: query this workspace's findings.db for hosts/"
+        "services/prior notes.\n"
         f"- {CONSULT_TOOL_NAME}: deep CVE/exploit analysis via the specialist "
         f"(at most {runtime.budget.max_calls_per_turn} call(s) per reasoning step).\n"
-        "Typical flow: search tools → format command → execute. "
-        "Do not invent tool results. Never ask the operator to bypass scope or HITL."
+        "Typical flow: search tools → format command → execute → rely on structured "
+        "extract in the tool result. Do not invent tool results. "
+        "Never ask the operator to bypass scope or HITL."
     )
 
 
@@ -219,7 +226,22 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
             on_targets_seen=_mark_targets,
             on_tier2_confirmed=_mark_tier2,
         )
-        return result.as_tool_text()
+        text = result.as_tool_text()
+        if result.status in {"ok", "error", "timeout"} and (
+            result.stdout or result.stderr
+        ):
+            parsed = parse_tool_output(result.command, result.stdout, result.stderr)
+            if not parsed.empty:
+                counts = runtime.findings_db.ingest_parsed(
+                    parsed,
+                    session_id=runtime.session_id,
+                    evidence_path=result.raw_output_path,
+                )
+                text = (
+                    f"{text}\n\n{format_parse_for_llm(parsed)}\n"
+                    f"findings_db_upsert={counts}"
+                )
+        return text
 
     @tool(SEARCH_TOOLS_NAME)
     def search_kali_tools_tool(query: str, n_results: int = 5) -> str:
@@ -239,7 +261,30 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
             n_results=max(1, min(int(n_results), 10)),
         )
 
-    return [search_kali_tools_tool, execute_kali_command_tool, consult_security_expert_tool]
+    @tool("search_past_engagements")
+    def search_past_engagements_tool(query: str, limit: int = 20) -> str:
+        """
+        Search this workspace's findings database for hosts, services, and notes
+        from earlier sessions in the same engagement.
+
+        Args:
+            query: Host, service, path, or keyword to look up.
+            limit: Max rows to return.
+        """
+        hits = runtime.findings_db.search(query, limit=max(1, min(int(limit), 50)))
+        if not hits:
+            return f"search_past_engagements: no matches for {query!r}"
+        lines = [f"search_past_engagements query={query!r} results={len(hits)}"]
+        for hit in hits:
+            lines.append(str(hit))
+        return "\n".join(lines)
+
+    return [
+        search_kali_tools_tool,
+        execute_kali_command_tool,
+        search_past_engagements_tool,
+        consult_security_expert_tool,
+    ]
 
 
 def _checkpoint_path(workspace: Workspace, session_id: str) -> Path:
@@ -463,10 +508,11 @@ class PotocusAgent:
         return [m for m in (state.get("messages") or []) if isinstance(m, ToolMessage)]
 
     def close(self) -> None:
-        """Close the checkpoint SQLite connection."""
+        """Close checkpoint and findings DB connections."""
         if self.runtime._db_conn is not None:
             self.runtime._db_conn.close()
             self.runtime._db_conn = None
+        self.runtime.findings_db.close()
 
 
 def create_agent(
@@ -504,6 +550,7 @@ def create_agent(
         scope_yaml=workspace.scope_yaml if workspace.mode == "scoped" else None,
     )
     vectorstore = WorkspaceVectorStore(workspace.vectorstore_dir)
+    findings_db = FindingsDB(workspace.findings_db)
 
     runtime = GraphRuntime(
         workspace=workspace,
@@ -514,6 +561,7 @@ def create_agent(
         budget=SpecialistBudget(max_calls_per_turn=endpoints.specialist_calls_per_turn),
         scope_guard=scope_guard,
         vectorstore=vectorstore,
+        findings_db=findings_db,
         context_token_limit=limit,
         keep_recent_messages=keep_recent,
         command_timeout_seconds=cmd_timeout,
