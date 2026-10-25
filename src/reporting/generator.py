@@ -12,6 +12,7 @@ import yaml
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from src.memory.findings_db import FindingsDB
+from src.utils.secrets import scrub_secrets
 from src.workspace.manager import Workspace
 from src.workspace.session_store import list_session_ids, read_session_meta
 
@@ -244,7 +245,7 @@ def generate_report(
     if template not in ("pentest", "bug_bounty", "research"):
         raise ValueError(f"Unsupported template: {template}")
 
-    markdown = render_markdown(workspace, template=template)
+    markdown = scrub_secrets(render_markdown(workspace, template=template))
     out_dir = Path(output_dir) if output_dir else workspace.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

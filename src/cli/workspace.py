@@ -178,3 +178,32 @@ def workspace_set_mode(
         raise typer.Exit(code=1) from exc
 
     console.print(f"[green]Mode set to[/green] {updated.mode}")
+
+
+@app.command("set-pacing")
+def workspace_set_pacing(
+    pacing: str = typer.Argument(..., help="stealth | normal | aggressive"),
+) -> None:
+    """Set the workspace default pacing profile (sessions may override)."""
+    if pacing not in ("stealth", "normal", "aggressive"):
+        console.print("[red]Invalid pacing.[/red] Use stealth | normal | aggressive")
+        raise typer.Exit(code=1)
+
+    active = get_active_workspace_path()
+    if active is None:
+        console.print("[yellow]No active workspace.[/yellow]")
+        raise typer.Exit(code=1)
+
+    try:
+        workspace = load_workspace(active)
+        from src.workspace.manager import save_workspace_config
+
+        updated = save_workspace_config(workspace, {"pacing": pacing})
+    except WorkspaceError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Workspace pacing:[/green] {updated.pacing} "
+        "(session overrides via `potocus session set-pacing` still win)"
+    )

@@ -231,6 +231,7 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
             raw_output_dir=runtime.raw_output_dir,
             timeout_seconds=float(timeout),
             background=bool(background),
+            pacing=runtime.effective_pacing,
             on_targets_seen=_mark_targets,
             on_tier2_confirmed=_mark_tier2,
         )

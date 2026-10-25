@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+
+from src.utils.secrets import scrub_secrets
 
 if TYPE_CHECKING:
     from src.utils.output_parser import ParsedOutput
@@ -15,28 +16,14 @@ if TYPE_CHECKING:
 Severity = Literal["info", "low", "medium", "high", "critical", "unknown"]
 FindingKind = Literal["host", "service", "path", "vuln", "cred", "note"]
 
-_SECRET_PATTERNS = (
-    re.compile(
-        r"(?i)(authorization\s*:\s*bearer\s+)[a-z0-9\-._~+/]+=*",
-    ),
-    re.compile(r"(?i)bearer\s+[a-z0-9\-._~+/]+=*"),
-    re.compile(
-        r"(?i)(api[_-]?key|token|secret|password|passwd)\s*[:=]\s*\S+",
-    ),
-    re.compile(
-        r"(?i)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END"
-    ),
-)
-
-
-def scrub_secrets(text: str | None) -> str:
-    """Redact common secret patterns before persisting to findings.db."""
-    if not text:
-        return ""
-    scrubbed = text
-    for pattern in _SECRET_PATTERNS:
-        scrubbed = pattern.sub("[REDACTED]", scrubbed)
-    return scrubbed
+# Re-export for callers that imported scrub_secrets from this module.
+__all__ = [
+    "FindingsDB",
+    "FindingRecord",
+    "HostRecord",
+    "ServiceRecord",
+    "scrub_secrets",
+]
 
 
 def _utcnow() -> str:

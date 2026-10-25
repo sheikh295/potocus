@@ -13,12 +13,14 @@ from typing import Any, Callable, Literal
 
 from langgraph.types import interrupt
 
+from src.tools.pacing import apply_pacing
 from src.tools.risk_classification import (
     ClassificationResult,
     RiskTier,
     classify_command,
     tier_requires_hitl,
 )
+from src.utils.secrets import scrub_secrets
 from src.workspace.scope_guard import ScopeCheckResult, ScopeGuard, extract_targets_from_command
 
 logger = logging.getLogger("potocus.terminal")
@@ -75,8 +77,8 @@ class ExecutionResult:
             return f"{label}:\n{text}" if text else f"{label}: (empty)"
 
         if self.status in {"ok", "error", "timeout"}:
-            lines.append(_clip("stdout", self.stdout))
-            lines.append(_clip("stderr", self.stderr))
+            lines.append(_clip("stdout", scrub_secrets(self.stdout)))
+            lines.append(_clip("stderr", scrub_secrets(self.stderr)))
         return "\n".join(lines)
 
 
@@ -115,7 +117,8 @@ def _write_raw_output(
         f"{'=' * 60}\nSTDOUT\n{'=' * 60}\n{stdout}\n"
         f"{'=' * 60}\nSTDERR\n{'=' * 60}\n{stderr}\n"
     )
-    path.write_text(body, encoding="utf-8")
+    # Scrub secrets in archived raw output (shareable/audit logs).
+    path.write_text(scrub_secrets(body), encoding="utf-8")
     return path
 
 
@@ -140,6 +143,7 @@ def execute_kali_command(
     raw_output_dir: Path,
     timeout_seconds: float = 120.0,
     background: bool = False,
+    pacing: str = "normal",
     hitl: HitlCallback | None = None,
     on_targets_seen: Callable[[list[str]], None] | None = None,
     on_tier2_confirmed: Callable[[], None] | None = None,
@@ -149,14 +153,22 @@ def execute_kali_command(
 
     Order of controls (all in Python — never delegated to the LLM):
       1. Parse argv (``shell=False``)
-      2. ScopeGuard — block out-of-scope targets
-      3. Risk classification — Tier 1/2/3
-      4. New-target escalation — first touch of an in-scope host still needs HITL
-      5. HITL interrupt when required
-      6. ``subprocess.run`` / ``Popen`` execution
-      7. Full raw output archival; truncated text returned to the model
+      2. Apply pacing profile (stealth/normal/aggressive timing flags)
+      3. ScopeGuard — block out-of-scope targets
+      4. Risk classification — Tier 1/2/3
+      5. New-target escalation — first touch of an in-scope host still needs HITL
+      6. HITL interrupt when required
+      7. ``subprocess.run`` / ``Popen`` execution
+      8. Full raw output archival (secret-scrubbed); truncated text to the model
     """
-    argv = parse_command(command)
+    requested = parse_command(command)
+    paced = apply_pacing(requested, pacing)
+    argv = paced.argv
+    pacing_note = (
+        f"pacing={paced.profile}"
+        + (f" applied[{', '.join(paced.notes)}]" if paced.notes else "")
+    )
+
     classification: ClassificationResult = classify_command(argv)
     scope = scope_guard.check_command(argv)
 
@@ -168,7 +180,7 @@ def execute_kali_command(
             tier=classification.tier,
             tier_reason=classification.reason,
             scope=scope,
-            message=scope.reason,
+            message=f"{scope.reason} | {pacing_note}",
         )
 
     targets = list(scope.targets) or list(extract_targets_from_command(argv))
@@ -191,6 +203,9 @@ def execute_kali_command(
             "tool": TOOL_NAME,
             "command": argv,
             "command_display": shlex.join(argv),
+            "requested_command": shlex.join(requested),
+            "pacing": paced.profile,
+            "pacing_notes": list(paced.notes),
             "tier": classification.tier.value,
             "tier_name": classification.tier.name,
             "tier_reason": hitl_reason,
@@ -213,7 +228,7 @@ def execute_kali_command(
                 tier=classification.tier,
                 tier_reason=hitl_reason,
                 scope=scope,
-                message="Operator denied execution",
+                message=f"Operator denied execution | {pacing_note}",
             )
         if classification.tier == RiskTier.TIER_2_ACTIVE and on_tier2_confirmed:
             on_tier2_confirmed()
@@ -234,6 +249,19 @@ def execute_kali_command(
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+        except FileNotFoundError:
+            log_handle.close()
+            return ExecutionResult(
+                status="error",
+                command=argv,
+                tier=classification.tier,
+                tier_reason=classification.reason,
+                scope=scope,
+                message=(
+                    f"command not found: {argv[0]} — not installed on this host "
+                    f"(expected on Kali). | {pacing_note}"
+                ),
+            )
         except OSError as exc:
             log_handle.close()
             return ExecutionResult(
@@ -242,7 +270,7 @@ def execute_kali_command(
                 tier=classification.tier,
                 tier_reason=classification.reason,
                 scope=scope,
-                message=f"failed to start: {exc}",
+                message=f"failed to start: {exc} | {pacing_note}",
             )
         _mark_seen()
         logger.info("background start pid=%s cmd=%s log=%s", proc.pid, argv, log_path)
@@ -254,7 +282,7 @@ def execute_kali_command(
             scope=scope,
             pid=proc.pid,
             raw_output_path=str(log_path),
-            message=f"background process started; output → {log_path}",
+            message=f"background process started; output → {log_path} | {pacing_note}",
         )
 
     try:
@@ -282,6 +310,7 @@ def execute_kali_command(
             status="timeout",
         )
         _mark_seen()
+        logger.error("timeout after %ss cmd=%s", timeout_seconds, argv)
         return ExecutionResult(
             status="timeout",
             command=argv,
@@ -291,17 +320,36 @@ def execute_kali_command(
             stdout=stdout,
             stderr=stderr or f"timed out after {timeout_seconds}s",
             raw_output_path=str(raw_path),
-            message=f"command timed out after {timeout_seconds}s",
+            message=(
+                f"command timed out after {timeout_seconds}s — try a narrower scan "
+                f"or raise timeout_seconds | {pacing_note}"
+            ),
         )
-    except OSError as exc:
+    except FileNotFoundError:
         _mark_seen()
+        logger.error("command not found: %s", argv[0])
         return ExecutionResult(
             status="error",
             command=argv,
             tier=classification.tier,
             tier_reason=classification.reason,
             scope=scope,
-            message=f"execution error: {exc}",
+            message=(
+                f"command not found: {argv[0]} — not installed on this host "
+                f"(expected on Kali). Self-correct with search_kali_tools or "
+                f"a different binary. | {pacing_note}"
+            ),
+        )
+    except OSError as exc:
+        _mark_seen()
+        logger.error("execution OSError cmd=%s err=%s", argv, exc)
+        return ExecutionResult(
+            status="error",
+            command=argv,
+            tier=classification.tier,
+            tier_reason=classification.reason,
+            scope=scope,
+            message=f"execution error: {exc} | {pacing_note}",
         )
 
     raw_path = _write_raw_output(
@@ -316,12 +364,16 @@ def execute_kali_command(
 
     status: Literal["ok", "error"] = "ok" if completed.returncode == 0 else "error"
     logger.info(
-        "executed status=%s code=%s cmd=%s raw=%s",
+        "executed status=%s code=%s cmd=%s raw=%s pacing=%s",
         status,
         completed.returncode,
         argv,
         raw_path,
+        paced.profile,
     )
+    hint = ""
+    if status == "error" and (completed.stderr or "").strip():
+        hint = " — inspect stderr and adjust flags; output was archived for audit"
     return ExecutionResult(
         status=status,
         command=argv,
@@ -332,4 +384,5 @@ def execute_kali_command(
         stderr=completed.stderr or "",
         exit_code=completed.returncode,
         raw_output_path=str(raw_path),
+        message=f"{pacing_note}{hint}",
     )

@@ -76,7 +76,7 @@ potocus chat
 
 | Command | Purpose |
 |---|---|
-| `potocus workspace` | init / switch / show / set-mode |
+| `potocus workspace` | init / switch / show / set-mode / set-pacing |
 | `potocus scope` | add / remove / list / check |
 | `potocus session` | new / list / show / resume / rename / close / set-phase / set-focus / set-pacing |
 | `potocus tools` | index / search / status (Kali manuals → ChromaDB) |
@@ -85,6 +85,34 @@ potocus chat
 | `potocus chat` | LangGraph ReAct REPL + HITL panels |
 | `potocus status` | workspace / session / phase / mode |
 | `potocus config` | show / test-ollama / classify / consult |
+
+## Live testing (Mac now → Kali next)
+
+Phases 1–10 are implemented. Suggested first live pass on Mac:
+
+```bash
+source .venv/bin/activate
+potocus config test-ollama
+potocus workspace init ./live-lab --mode unscoped
+potocus workspace set-pacing normal
+potocus tools index
+potocus session new --name smoke --focus "local checks"
+potocus chat
+# try: ask for search_kali_tools, then execute_kali_command with `uname -a` / `echo hi`
+potocus findings summary
+potocus report generate --format md --template research
+```
+
+On Kali later:
+
+```bash
+pip install -e .   # or git/wheel install
+export POTOCUS_OLLAMA_BASE_URL=http://<mac-lan-ip>:11434/v1
+export POTOCUS_OLLAMA_NATIVE_URL=http://<mac-lan-ip>:11434
+potocus config test-ollama
+potocus tools index --reset --live-only
+# then scoped engagement + real tool execution with HITL
+```
 
 ## Tests
 
