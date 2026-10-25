@@ -231,7 +231,7 @@ def seed_dir() -> Path:
     return SEED_DIR
 
 
-def capture_help(binary: str, *, timeout_seconds: float = 8.0) -> str | None:
+def capture_help(binary: str, *, timeout_seconds: float = 5.0) -> str | None:
     """
     Capture ``--help`` / ``-h`` / ``help`` output for an installed binary.
 
@@ -247,18 +247,39 @@ def capture_help(binary: str, *, timeout_seconds: float = 8.0) -> str | None:
         [path, "help"],
     ]
     for argv in candidates:
+        proc = None
         try:
-            completed = subprocess.run(  # noqa: S603
+            proc = subprocess.Popen(  # noqa: S603
                 argv,
                 shell=False,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_seconds,
-                check=False,
+                start_new_session=True,
             )
-        except (OSError, subprocess.TimeoutExpired):
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                import os, signal
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+                continue
+        except (OSError, ValueError):
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             continue
-        text = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
+        text = ((stdout or "") + "\n" + (stderr or "")).strip()
         if len(text) >= 40:
             return text[:50_000]
     return None
