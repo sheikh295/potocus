@@ -6,7 +6,6 @@ from typing import Any
 
 import typer
 import yaml
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
@@ -14,6 +13,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from src.cli.chat_ui import ActivityDisplay, render_stream_event
 from src.graph import PotocusAgent, create_agent, valid_phases
 from src.tools.discovery import TOOL_NAME as SEARCH_TOOLS_NAME
 from src.tools.expert import TOOL_NAME as CONSULT_TOOL_NAME
@@ -51,77 +51,102 @@ def _save_session_phase(workspace, session_id: str, phase: str) -> None:
         yaml.safe_dump(meta, handle, default_flow_style=False, sort_keys=False)
 
 
-def _hitl_prompt(payload: dict[str, Any]) -> str:
-    """Render a Rich HITL panel and return approve/deny."""
-    tier = str(payload.get("tier_name") or payload.get("tier") or "?")
-    color = "red" if "3" in str(payload.get("tier", "")) or "EXPLOIT" in tier else "yellow"
-    lines = [
-        f"[bold]{payload.get('tool', EXECUTE_TOOL_NAME)}[/bold]",
-        f"command: [white]{payload.get('command_display') or payload.get('command')}[/white]",
-        f"tier: [{color}]{tier}[/{color}] — {payload.get('tier_reason', '')}",
-        f"mode: {payload.get('mode')}",
-        f"scope: {payload.get('scope_decision')} — {payload.get('scope_reason', '')}",
-    ]
-    targets = payload.get("targets") or []
-    new_targets = payload.get("new_targets") or []
-    if targets:
-        lines.append(f"targets: {', '.join(map(str, targets))}")
-    if new_targets:
-        lines.append(f"[yellow]new targets:[/yellow] {', '.join(map(str, new_targets))}")
-    console.print(
-        Panel(
-            "\n".join(lines),
-            title="HITL confirmation required",
-            border_style=color,
+def _make_hitl_prompt(ui: ActivityDisplay):
+    """Build a HITL callback that pauses the live spinner while prompting."""
+
+    def _hitl_prompt(payload: dict[str, Any]) -> str:
+        ui.pause()
+        tier = str(payload.get("tier_name") or payload.get("tier") or "?")
+        color = (
+            "red"
+            if "3" in str(payload.get("tier", "")) or "EXPLOIT" in tier
+            else "yellow"
         )
-    )
-    answer = Prompt.ask("Allow execution?", choices=["y", "n"], default="n")
-    return "approve" if answer.lower() == "y" else "deny"
-
-
-def _print_turn(agent: PotocusAgent, state: dict[str, Any], user_text: str) -> None:
-    """Render tool calls and the final assistant reply for this turn."""
-    messages = list(state.get("messages") or [])
-    start = 0
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if isinstance(msg, HumanMessage) and msg.content == user_text:
-            start = idx + 1
-            break
-
-    for msg in messages[start:]:
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            for call in msg.tool_calls:
-                name = call.get("name", "tool")
-                args = call.get("args", {})
-                console.print(
-                    Panel.fit(
-                        f"[bold]{name}[/bold]\n{args}",
-                        title="tool call",
-                        border_style="cyan",
-                    )
-                )
-        elif isinstance(msg, ToolMessage):
-            content = str(msg.content)
-            border = "yellow" if (
-                "BUDGET_EXCEEDED" in content
-                or "blocked_scope" in content
-                or "denied_hitl" in content
-            ) else "magenta"
-            console.print(
-                Panel(
-                    Markdown(content),
-                    title=f"tool result · {msg.name or CONSULT_TOOL_NAME}",
-                    border_style=border,
-                )
+        lines = [
+            f"[bold]{payload.get('tool', EXECUTE_TOOL_NAME)}[/bold]",
+            f"command: [white]{payload.get('command_display') or payload.get('command')}[/white]",
+            f"tier: [{color}]{tier}[/{color}] — {payload.get('tier_reason', '')}",
+            f"mode: {payload.get('mode')}",
+            f"scope: {payload.get('scope_decision')} — {payload.get('scope_reason', '')}",
+        ]
+        targets = payload.get("targets") or []
+        new_targets = payload.get("new_targets") or []
+        if targets:
+            lines.append(f"targets: {', '.join(map(str, targets))}")
+        if new_targets:
+            lines.append(
+                f"[yellow]new targets:[/yellow] {', '.join(map(str, new_targets))}"
             )
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="HITL confirmation required",
+                border_style=color,
+            )
+        )
+        answer = Prompt.ask("Allow execution?", choices=["y", "n"], default="n")
+        ui.resume(detail="resuming after HITL")
+        return "approve" if answer.lower() == "y" else "deny"
+
+    return _hitl_prompt
+
+
+def _print_final_reply(agent: PotocusAgent, state: dict[str, Any]) -> None:
+    """Render the final assistant message plus a verbose turn summary.
+
+    After the live spinner stops, show the operator a concise recap of what
+    the agent actually did this turn: thinking/reasoning, tools called, and
+    the final reply — like Claude Code's turn summary panel.
+    """
+    from src.utils.llm_display import messages_to_events
+
+    messages = state.get("messages") or []
+    events = messages_to_events(messages)
+
+    # Only look at events from this turn (new messages appended this turn).
+    thinking_events = [e for e in events if e["type"] == "thinking"]
+    tool_call_events = [e for e in events if e["type"] == "tool_call"]
+    tool_result_events = [e for e in events if e["type"] == "tool_result"]
 
     reply = agent.latest_ai_text(state)  # type: ignore[arg-type]
+
+    # Build a compact turn summary panel.
+    summary_lines: list[str] = []
+    if thinking_events:
+        # Show the last thinking block (most recent reasoning).
+        last_think = thinking_events[-1]["text"]
+        shown = last_think if len(last_think) <= 1500 else last_think[:1500] + "\n… [truncated]"
+        summary_lines.append(f"[dim blue]Thinking:[/dim blue] {shown}")
+    if tool_call_events:
+        for tce in tool_call_events:
+            name = tce.get("name", "tool")
+            args = tce.get("args") or {}
+            arg_str = ", ".join(f"{k}={v}" for k, v in args.items())
+            summary_lines.append(f"[cyan]Tool call:[/cyan] {name}({arg_str})")
+    if tool_result_events:
+        for tre in tool_result_events:
+            name = tre.get("name", "tool")
+            content = str(tre.get("content") or "")
+            status = "ok" if not any(
+                s in content for s in ("BUDGET_EXCEEDED", "blocked_scope", "denied_hitl", "error")
+            ) else "blocked"
+            summary_lines.append(f"[magenta]Tool result:[/magenta] {name} → {status}")
+
+    if summary_lines:
+        console.print()
+        console.print(
+            Panel(
+                "\n".join(summary_lines),
+                title="turn summary",
+                border_style="cyan",
+            )
+        )
+
     if reply:
         console.print()
         console.print(Markdown(reply))
         console.print()
-    else:
+    elif not summary_lines:
         console.print("[yellow]No final assistant message in this turn.[/yellow]")
 
 
@@ -236,11 +261,23 @@ def chat(ctx: typer.Context) -> None:
                 console.print(f"[green]Phase set to[/green] {new_phase}")
                 continue
 
-            console.print("[dim]agent loop…[/dim]")
+            ui = ActivityDisplay(console=console, verbose=True)
+            agent.runtime.event_sink = lambda event: render_stream_event(ui, event)
+            ui.start(detail="starting agent loop")
+            state: dict[str, Any] | None = None
             try:
-                state = agent.invoke_turn(user_text, hitl_callback=_hitl_prompt)
+                state = agent.invoke_turn(
+                    user_text,
+                    hitl_callback=_make_hitl_prompt(ui),
+                )
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[red]Agent error:[/red] {exc}")
+                continue
+            finally:
+                ui.stop()
+                agent.runtime.event_sink = None
+
+            if state is None:
                 continue
 
             touch_session(
@@ -250,6 +287,6 @@ def chat(ctx: typer.Context) -> None:
                 message_count=len(state.get("messages") or []),
                 checkpoint_exists=True,
             )
-            _print_turn(agent, state, user_text)
+            _print_final_reply(agent, state)
     finally:
         agent.close()

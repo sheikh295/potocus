@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Sequence, TypedDict
+from typing import Annotated, Any, Callable, Iterator, Sequence, TypedDict
 
 from langchain_core.messages import (
     AIMessage,
@@ -44,6 +44,7 @@ from src.tools.terminal import (
     TOOL_NAME as EXECUTE_TOOL_NAME,
     execute_kali_command,
 )
+from src.utils.llm_display import extract_reasoning, messages_to_events
 from src.utils.output_parser import format_parse_for_llm, parse_tool_output
 from src.workspace.manager import EngagementPhase, Workspace
 from src.workspace.scope_guard import ScopeGuard
@@ -81,10 +82,19 @@ class GraphRuntime:
     tier2_confirmed: bool = False
     pacing_override: str | None = None
     target_focus: str = ""
-    context_token_limit: int = 8000
+    context_token_limit: int = 200000
     keep_recent_messages: int = 8
     command_timeout_seconds: float = 120.0
+    event_sink: Callable[[dict[str, Any]], None] | None = None
     _db_conn: sqlite3.Connection | None = field(default=None, repr=False)
+
+    def emit(self, event: dict[str, Any]) -> None:
+        """Push a UI/telemetry event if a sink is attached."""
+        if self.event_sink is not None:
+            try:
+                self.event_sink(event)
+            except Exception:  # noqa: BLE001 — UI must never break the graph
+                logger.debug("event_sink failed", exc_info=True)
 
     @property
     def effective_pacing(self) -> str:
@@ -149,16 +159,87 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
     )
 
 
-def _make_llm(model: str, temperature: float) -> ChatOpenAI:
+class OllamaChatOpenAI(ChatOpenAI):
+    """ChatOpenAI subclass that captures Ollama's non-standard ``reasoning``
+    field (streamed as ``delta.reasoning``) into ``additional_kwargs``."""
+
+    def _convert_chunk_to_generation_chunk(
+        self, chunk, default_chunk_class, base_generation_info=None
+    ):
+        gen = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if gen is not None and isinstance(getattr(gen, "message", None), AIMessage):
+            try:
+                choices = chunk.get("choices") if isinstance(chunk, dict) else None
+            except Exception:  # noqa: BLE001
+                choices = None
+            if choices:
+                delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+                if isinstance(delta, dict):
+                    reasoning = (
+                        delta.get("reasoning")
+                        or delta.get("reasoning_content")
+                        or delta.get("thinking")
+                    )
+                    if isinstance(reasoning, str) and reasoning:
+                        msg = gen.message
+                        ak = dict(getattr(msg, "additional_kwargs", None) or {})
+                        ak["reasoning"] = ak.get("reasoning", "") + reasoning
+                        msg.additional_kwargs = ak
+        return gen
+
+    def _create_chat_result(self, response, generation_info=None):
+        result = super()._create_chat_result(response, generation_info)
+        try:
+            response_dict = (
+                response
+                if isinstance(response, dict)
+                else response.model_dump(
+                    exclude={"choices": {"__all__": {"message": {"parsed"}}}},
+                    warnings=False,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            response_dict = {}
+        choices = response_dict.get("choices") if isinstance(response_dict, dict) else None
+        if isinstance(choices, list):
+            for idx, gen in enumerate(getattr(result, "generations", []) or []):
+                if idx >= len(choices):
+                    break
+                res = choices[idx]
+                msg = res.get("message") if isinstance(res, dict) else getattr(res, "message", None)
+                reasoning = None
+                if isinstance(msg, dict):
+                    reasoning = msg.get("reasoning") or msg.get("reasoning_content") or msg.get("thinking")
+                    if reasoning is None and isinstance(msg.get("additional_kwargs"), dict):
+                        reasoning = msg["additional_kwargs"].get("reasoning")
+                else:
+                    reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+                if isinstance(reasoning, str) and reasoning.strip():
+                    m = gen.message
+                    ak = dict(getattr(m, "additional_kwargs", None) or {})
+                    ak["reasoning"] = reasoning.strip() if not ak.get("reasoning") else ak["reasoning"]
+                    # prefer full captured text
+                    if reasoning.strip():
+                        ak["reasoning"] = reasoning.strip()
+                    m.additional_kwargs = ak
+        return result
+
+
+
+def _make_llm(model: str, temperature: float, *, think: bool = False) -> OllamaChatOpenAI:
     """OpenAI-compatible chat model pointed at local Ollama."""
     endpoints = get_model_endpoints()
-    return ChatOpenAI(
+    return OllamaChatOpenAI(
         base_url=endpoints.base_url,
         api_key="ollama",
         model=model,
         temperature=temperature,
         timeout=endpoints.timeout_seconds,
-        extra_body={"think": False},
+        # Qwen3: think=True surfaces reasoning for the verbose CLI; keep False
+        # for compaction / quiet invokes so content is not swallowed.
+        extra_body={"think": think},
     )
 
 
@@ -310,16 +391,32 @@ def build_graph(runtime: GraphRuntime) -> Any:
     Flow: START → compact → agent → (tools ↔ agent)* → END
     """
     tools = build_tools(runtime)
-    tool_node = ToolNode(tools)
+    base_tool_node = ToolNode(tools)
     endpoints = get_model_endpoints()
+
+    def tools_node(state: AgentState) -> dict[str, Any]:
+        """Run tools and surface results to the event sink."""
+        runtime.emit({"type": "node", "node": "tools"})
+        runtime.emit({"type": "status", "text": "executing tool call(s)"})
+        result = base_tool_node.invoke(state)
+        for event in messages_to_events(list(result.get("messages") or [])):
+            runtime.emit(event)
+        # Persist gate flags mutated inside tools.
+        result = dict(result)
+        result["seen_targets"] = list(runtime.seen_targets)
+        result["tier2_confirmed"] = runtime.tier2_confirmed
+        return result
 
     def compact_node(state: AgentState) -> dict[str, Any]:
         """Proactively summarize older turns before hitting the context ceiling."""
+        runtime.emit({"type": "node", "node": "compact"})
         messages = list(state.get("messages") or [])
         tokens = estimate_tokens(messages)
         limit = runtime.context_token_limit
         if tokens < limit or len(messages) <= runtime.keep_recent_messages + 1:
+            runtime.emit({"type": "status", "text": "context within budget — skip compact"})
             return {"context_tokens_approx": tokens}
+        runtime.emit({"type": "status", "text": "context high — summarizing older turns"})
 
         keep = runtime.keep_recent_messages
         older = messages[:-keep] if keep < len(messages) else messages[:1]
@@ -371,6 +468,7 @@ def build_graph(runtime: GraphRuntime) -> Any:
 
     def agent_node(state: AgentState) -> dict[str, Any]:
         """One orchestrator reasoning step (may request tools)."""
+        runtime.emit({"type": "node", "node": "agent"})
         runtime.budget.reset_turn()
         phase = str(state.get("phase") or runtime.phase)
         runtime.phase = phase
@@ -381,16 +479,94 @@ def build_graph(runtime: GraphRuntime) -> Any:
         runtime.seen_targets = merged_targets
         runtime.tier2_confirmed = bool(state.get("tier2_confirmed")) or runtime.tier2_confirmed
 
-        llm = _make_llm(runtime.orchestrator_model, endpoints.temperature).bind_tools(
-            tools
-        )
+        # Verbose CLI: stream + think tokens. Quiet/tests: plain invoke.
+        want_stream = runtime.event_sink is not None
+        llm = _make_llm(
+            runtime.orchestrator_model,
+            endpoints.temperature,
+            think=want_stream,
+        ).bind_tools(tools)
         prior = list(state.get("messages") or [])
         # System prompt is injected each step so phase changes apply immediately.
         prompt = [SystemMessage(content=_build_system_prompt(runtime, phase)), *prior]
-        response = llm.invoke(prompt)
-        # Normalize streaming chunks if any.
+
+        response: AIMessage | None = None
+        streamed_ok = False
+        if want_stream:
+            runtime.emit({"type": "status", "text": "orchestrator streaming"})
+            reasoning_buffer = ""
+            REASONING_FLUSH_CHARS = 150
+            try:
+                for chunk in llm.stream(prompt):
+                    msg = (
+                        chunk
+                        if isinstance(chunk, AIMessage)
+                        else message_chunk_to_message(chunk)
+                    )
+                    piece = msg.content if isinstance(msg.content, str) else ""
+                    if piece:
+                        # Flush any pending reasoning before content starts.
+                        if reasoning_buffer.strip():
+                            runtime.emit({"type": "thinking", "text": reasoning_buffer})
+                            reasoning_buffer = ""
+                        runtime.emit({"type": "llm_token", "content": piece})
+                    # Live think preview: coalesce reasoning deltas into readable
+                    # chunks (Claude-style) instead of one panel per token.
+                    chunk_reasoning = extract_reasoning(chunk, strip=False)
+                    if chunk_reasoning:
+                        reasoning_buffer += chunk_reasoning
+                        if len(reasoning_buffer) >= REASONING_FLUSH_CHARS:
+                            runtime.emit({"type": "thinking", "text": reasoning_buffer})
+                            reasoning_buffer = ""
+                    elif isinstance(msg, AIMessage):
+                        msg_reasoning = extract_reasoning(msg, strip=False)
+                        if msg_reasoning:
+                            reasoning_buffer += msg_reasoning
+                            if len(reasoning_buffer) >= REASONING_FLUSH_CHARS:
+                                runtime.emit({"type": "thinking", "text": reasoning_buffer})
+                                reasoning_buffer = ""
+                    response = msg if response is None else response + msg  # type: ignore[operator]
+                # Flush trailing reasoning.
+                if reasoning_buffer.strip():
+                    runtime.emit({"type": "thinking", "text": reasoning_buffer})
+                    reasoning_buffer = ""
+                streamed_ok = True
+            except Exception:  # noqa: BLE001 — fall back to invoke
+                logger.debug("llm.stream failed; falling back to invoke", exc_info=True)
+                response = None
+
+        if response is None:
+            response = llm.invoke(prompt)
         if not isinstance(response, AIMessage):
             response = message_chunk_to_message(response)
+
+        # Qwen3 + think can occasionally return empty content; retry quiet once.
+        content_text = (
+            response.content if isinstance(response.content, str) else str(response.content or "")
+        )
+        if (
+            want_stream
+            and not content_text.strip()
+            and not response.tool_calls
+        ):
+            runtime.emit({"type": "status", "text": "empty think reply — retrying quiet"})
+            quiet = _make_llm(
+                runtime.orchestrator_model,
+                endpoints.temperature,
+                think=False,
+            ).bind_tools(tools)
+            response = quiet.invoke(prompt)
+            if not isinstance(response, AIMessage):
+                response = message_chunk_to_message(response)
+
+        # Thinking / tool calls for the CLI. Skip duplicate assistant (printed after).
+        skip_types = {"llm_token", "assistant"}
+        if streamed_ok:
+            skip_types = skip_types | {"thinking"}
+        for event in messages_to_events([response]):
+            if event["type"] in skip_types:
+                continue
+            runtime.emit(event)
 
         all_for_estimate = prior + [response]
         return {
@@ -405,7 +581,7 @@ def build_graph(runtime: GraphRuntime) -> Any:
     graph = StateGraph(AgentState)
     graph.add_node("compact", compact_node)
     graph.add_node("agent", agent_node)
-    graph.add_node("tools", tool_node)
+    graph.add_node("tools", tools_node)
     graph.add_edge(START, "compact")
     graph.add_edge("compact", "agent")
     graph.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})

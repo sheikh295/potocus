@@ -21,7 +21,8 @@ defaults:
 
 agent:
   # Approximate token ceiling before the compact node summarizes older turns (§10).
-  context_token_limit: 8000
+  # Set high when using 256k-context models (Qwen3 on Ollama with 256k ctx).
+  context_token_limit: 200000
   keep_recent_messages: 8
   command_timeout_seconds: 120
 
