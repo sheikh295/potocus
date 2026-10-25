@@ -271,7 +271,7 @@ def capture_help(binary: str, *, timeout_seconds: float = 5.0) -> str | None:
                 except ProcessLookupError:
                     pass
                 proc.communicate()
-                continue
+                break  # Skip remaining candidates for this tool; it is likely interactive/hanging.
         except (OSError, ValueError):
             if proc is not None:
                 try:
