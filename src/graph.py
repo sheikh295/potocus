@@ -290,6 +290,11 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
         Pass the full command as a single string (e.g. ``nmap -sn 10.10.20.0/24``).
         Do not use shell metacharacters; arguments are parsed safely without a shell.
 
+        You may run any installed CLI tool, including tools not returned by
+        ``search_kali_tools`` (the index is curated and may be incomplete). If the
+        binary is missing, the result will say "command not found" — then try a
+        different binary or ask the operator.
+
         Args:
             command: The command line to run.
             timeout_seconds: Max seconds before the process is killed (foreground).
@@ -342,6 +347,10 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
 
         Use when you need a network scanner, web fuzzer, SMB enum tool, etc.
         Then call execute_kali_command with a concrete command line.
+
+        The index is curated and may not include every installed tool. If a needed
+        tool is not in the results, you can still call execute_kali_command with
+        its known binary name and handle "command not found" gracefully.
 
         Args:
             query: Natural-language description of the needed capability.
