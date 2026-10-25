@@ -3,14 +3,25 @@
 Local-first hybrid AI agent harness for authorized offensive security operations.
 
 - **Brain:** Ollama on macOS (Qwen3 orchestrator + Dolphin3-Cyber specialist)
-- **Hands:** Python harness (intended to run on Kali Linux)
+- **Hands:** Python harness (built on Mac, **runtime target = Kali Linux**)
 - **Control:** code-level scope enforcement + HITL risk tiers (not prompt trust)
 
 Full architecture: [`docs/master_doc_potocus.md`](docs/master_doc_potocus.md)
 
+## Mac build → Kali test
+
+Development happens on macOS. Full offensive-tool fidelity is validated later on Kali.
+
+| Environment | What works today | What to do |
+|---|---|---|
+| **macOS (now)** | CLI, workspaces, ScopeGuard, risk HITL, LangGraph, Ollama dual-model, tool search via **seed manuals** + any local binaries | `potocus tools index` then develop/test |
+| **Kali (later)** | Live `--help` from the real 600+ tool install | `pip install …` then `potocus tools index --reset --live-only` |
+
+Seed manuals live in `data/kali_tools/` so `search_kali_tools` is usable before Kali is available. They are **not** mocks of the search stack — they are real documents. On Kali, live capture replaces them.
+
 ## How you will use this (install, not “clone forever”)
 
-You do **not** need to keep a git clone as the runtime. Potocus is a normal Python package (`pyproject.toml` + `potocus` console script).
+Potocus is a normal Python package (`pyproject.toml` + `potocus` console script).
 
 | Mode | Command | When |
 |---|---|---|
@@ -22,9 +33,7 @@ You do **not** need to keep a git clone as the runtime. Potocus is a normal Pyth
 Typical production layout:
 
 1. **Mac host** — Ollama + both models; API reachable on the LAN (`http://<mac-ip>:11434`).
-2. **Kali VM** — `pip install potocus` (or install from git/wheel), set `POTOCUS_OLLAMA_BASE_URL` / `POTOCUS_OLLAMA_NATIVE_URL` to the Mac, then run `potocus …`.
-
-Secrets stay in `.env` / environment variables. Engagement data stays in the workspace directory you choose at `workspace init`.
+2. **Kali VM** — `pip install potocus`, point `POTOCUS_OLLAMA_*` at the Mac, `potocus tools index --reset --live-only`, then run engagements.
 
 ## Setup (dev)
 
@@ -34,8 +43,6 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env   # optional
 ```
-
-Require both models in Ollama:
 
 ```bash
 ollama list
@@ -48,6 +55,8 @@ ollama list
 ```bash
 potocus config test-ollama
 potocus workspace init ./lab --mode unscoped
+potocus tools index
+potocus tools search "network port scanner"
 potocus session new --name "first-run"
 potocus status
 potocus chat
@@ -58,12 +67,9 @@ Scoped engagement:
 ```bash
 potocus workspace init ./clientX-pentest --mode scoped
 potocus scope add 10.10.20.0/24 --note "corp-vlan per ROE"
-potocus scope check -- nmap -sn 10.10.20.5
-potocus config classify -- nmap -sV 10.10.20.5
-potocus config consult "What does CVE mean in one sentence?" --twice
+potocus tools index
 potocus session new --name "external-recon"
 potocus chat
-# inside chat: /expert <question>  → consult_security_expert (1/turn)
 ```
 
 ## CLI
@@ -73,13 +79,14 @@ potocus chat
 | `potocus workspace` | init / switch / show / set-mode |
 | `potocus scope` | add / remove / list / check |
 | `potocus session` | new / list / resume / rename / close / set-phase |
-| `potocus chat` | LangGraph ReAct REPL + HITL panels for risky commands |
+| `potocus tools` | index / search / status (Kali manuals → ChromaDB) |
+| `potocus chat` | LangGraph ReAct REPL + HITL panels |
 | `potocus status` | workspace / session / phase / mode |
 | `potocus config` | show / test-ollama / classify / consult |
 
 ## Tests
 
-Real filesystem + real classifiers — no mocks:
+Real filesystem, classifiers, Ollama, and ChromaDB — no mocks:
 
 ```bash
 pytest -q

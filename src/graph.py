@@ -34,6 +34,11 @@ from src.tools.expert import (
     SpecialistBudget,
     consult_security_expert,
 )
+from src.memory.vectorstore import WorkspaceVectorStore
+from src.tools.discovery import (
+    TOOL_NAME as SEARCH_TOOLS_NAME,
+    search_kali_tools,
+)
 from src.tools.terminal import (
     TOOL_NAME as EXECUTE_TOOL_NAME,
     execute_kali_command,
@@ -68,6 +73,7 @@ class GraphRuntime:
     specialist_model: str
     budget: SpecialistBudget
     scope_guard: ScopeGuard
+    vectorstore: WorkspaceVectorStore
     seen_targets: list[str] = field(default_factory=list)
     tier2_confirmed: bool = False
     context_token_limit: int = 8000
@@ -117,10 +123,13 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
         f"Phase: {phase}\n"
         f"Pacing: {ws.pacing}\n"
         f"Available tools:\n"
+        f"- {SEARCH_TOOLS_NAME}: find the right Kali tool and usage from manuals "
+        "(call this when unsure which binary/flags to use).\n"
         f"- {EXECUTE_TOOL_NAME}: run a host CLI command (argv string). "
         "ScopeGuard + risk HITL gate execution in code.\n"
         f"- {CONSULT_TOOL_NAME}: deep CVE/exploit analysis via the specialist "
         f"(at most {runtime.budget.max_calls_per_turn} call(s) per reasoning step).\n"
+        "Typical flow: search tools → format command → execute. "
         "Do not invent tool results. Never ask the operator to bypass scope or HITL."
     )
 
@@ -212,7 +221,25 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
         )
         return result.as_tool_text()
 
-    return [execute_kali_command_tool, consult_security_expert_tool]
+    @tool(SEARCH_TOOLS_NAME)
+    def search_kali_tools_tool(query: str, n_results: int = 5) -> str:
+        """
+        Search indexed Kali tool manuals (help text) for tools matching a need.
+
+        Use when you need a network scanner, web fuzzer, SMB enum tool, etc.
+        Then call execute_kali_command with a concrete command line.
+
+        Args:
+            query: Natural-language description of the needed capability.
+            n_results: How many tool manuals to return (default 5).
+        """
+        return search_kali_tools(
+            query,
+            store=runtime.vectorstore,
+            n_results=max(1, min(int(n_results), 10)),
+        )
+
+    return [search_kali_tools_tool, execute_kali_command_tool, consult_security_expert_tool]
 
 
 def _checkpoint_path(workspace: Workspace, session_id: str) -> Path:
@@ -476,6 +503,7 @@ def create_agent(
         mode=workspace.mode,
         scope_yaml=workspace.scope_yaml if workspace.mode == "scoped" else None,
     )
+    vectorstore = WorkspaceVectorStore(workspace.vectorstore_dir)
 
     runtime = GraphRuntime(
         workspace=workspace,
@@ -485,6 +513,7 @@ def create_agent(
         specialist_model=workspace.models.get("specialist") or endpoints.specialist,
         budget=SpecialistBudget(max_calls_per_turn=endpoints.specialist_calls_per_turn),
         scope_guard=scope_guard,
+        vectorstore=vectorstore,
         context_token_limit=limit,
         keep_recent_messages=keep_recent,
         command_timeout_seconds=cmd_timeout,

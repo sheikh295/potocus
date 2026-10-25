@@ -33,3 +33,4 @@ htmlcov/
 *.log
 _smoke_lab/
 _smoke_scoped/
+data/

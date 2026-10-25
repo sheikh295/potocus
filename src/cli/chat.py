@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 from src.graph import PotocusAgent, create_agent, valid_phases
+from src.tools.discovery import TOOL_NAME as SEARCH_TOOLS_NAME
 from src.tools.expert import TOOL_NAME as CONSULT_TOOL_NAME
 from src.tools.terminal import TOOL_NAME as EXECUTE_TOOL_NAME
 from src.utils.config import (
@@ -169,7 +170,7 @@ def chat(ctx: typer.Context) -> None:
             f"phase: {phase}\n"
             f"orchestrator: {agent.runtime.orchestrator_model}\n"
             f"specialist:   {agent.runtime.specialist_model}\n"
-            f"tools: {EXECUTE_TOOL_NAME}, {CONSULT_TOOL_NAME}\n"
+            f"tools: {SEARCH_TOOLS_NAME}, {EXECUTE_TOOL_NAME}, {CONSULT_TOOL_NAME}\n"
             f"context budget: {agent.runtime.context_token_limit} tokens (approx)\n"
             "[dim]Commands: /exit  /status  /phase <NAME>[/dim]",
             title="Potocus Chat (LangGraph)",

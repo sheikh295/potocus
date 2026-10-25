@@ -14,6 +14,11 @@ from src.tools.risk_classification import (
     classify_command,
     tier_requires_hitl,
 )
+from src.tools.discovery import (
+    TOOL_NAME as SEARCH_TOOLS_NAME,
+    index_tools,
+    search_kali_tools,
+)
 from src.tools.terminal import (
     TOOL_NAME as EXECUTE_TOOL_NAME,
     ExecutionResult,
@@ -24,6 +29,9 @@ from src.tools.terminal import (
 __all__ = [
     "CONSULT_TOOL_NAME",
     "EXECUTE_TOOL_NAME",
+    "SEARCH_TOOLS_NAME",
+    "index_tools",
+    "search_kali_tools",
     "ConsultResult",
     "SpecialistBudget",
     "SpecialistBudgetExceeded",
