@@ -1,0 +1,37 @@
+# Research Write-up — {{ workspace.name }}
+
+**Generated:** {{ generated_at }}  
+**Mode:** {{ workspace.mode }}
+
+## Goal / focus
+
+{% if sessions %}
+Session focus notes:
+{% for s in sessions -%}
+- **{{ s.name }}** ({{ s.phase }}): {{ s.target_focus or "(no focus set)" }}
+{% endfor %}
+{% else %}
+_No sessions yet._
+{% endif %}
+
+## Inventory
+
+- Hosts: {{ summary.hosts }}
+- Services: {{ summary.services }}
+- Findings: {{ summary.findings }}
+
+## Notes & findings (chronological-ish)
+
+{% for f in findings %}
+### {{ f.title }}
+
+`{{ f.kind }}` · {{ f.severity }} · {{ f.created_at }}  
+{{ f.detail or "" }}
+
+{% endfor %}
+
+## Host table
+
+{% for h in hosts -%}
+- {{ h.address }} {% if h.hostname %}({{ h.hostname }}){% endif %} {% if h.os_guess %}— {{ h.os_guess }}{% endif %}
+{% endfor %}

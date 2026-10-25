@@ -175,3 +175,33 @@ def findings_search(
         raise typer.Exit(code=1)
     for hit in hits:
         console.print(hit)
+
+
+@app.command("set-severity")
+def findings_set_severity(
+    finding_id: int = typer.Argument(..., help="Finding id from `findings list`."),
+    severity: str = typer.Option(
+        ...,
+        "--severity",
+        help="info | low | medium | high | critical",
+    ),
+    cvss: float | None = typer.Option(None, "--cvss", help="Optional CVSS score."),
+) -> None:
+    """Set severity/CVSS on a finding (used by report scoring)."""
+    allowed = {"info", "low", "medium", "high", "critical", "unknown"}
+    if severity not in allowed:
+        console.print(f"[red]Invalid severity.[/red] Choose from {sorted(allowed)}")
+        raise typer.Exit(code=1)
+    workspace = _require_workspace()
+    db = FindingsDB(workspace.findings_db)
+    try:
+        ok = db.update_finding_severity(finding_id, severity=severity, cvss=cvss)
+    finally:
+        db.close()
+    if not ok:
+        console.print(f"[red]Finding not found:[/red] {finding_id}")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[green]Updated finding[/green] {finding_id} → severity={severity}"
+        + (f" cvss={cvss}" if cvss is not None else "")
+    )

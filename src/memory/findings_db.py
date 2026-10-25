@@ -542,3 +542,24 @@ class FindingsDB:
             "services": int(services),
             "findings": int(findings),
         }
+
+    def update_finding_severity(
+        self,
+        finding_id: int,
+        *,
+        severity: str,
+        cvss: float | None = None,
+    ) -> bool:
+        """Update severity/CVSS for a finding. Returns False if id missing."""
+        row = self._conn.execute(
+            "SELECT id FROM findings WHERE id = ?",
+            (finding_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        self._conn.execute(
+            "UPDATE findings SET severity = ?, cvss = ? WHERE id = ?",
+            (severity, cvss, finding_id),
+        )
+        self._conn.commit()
+        return True
