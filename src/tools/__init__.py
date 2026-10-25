@@ -25,6 +25,28 @@ from src.tools.terminal import (
     execute_kali_command,
     parse_command,
 )
+from src.tools.filesystem import (
+    build_filesystem_tools,
+    read_file,
+    write_file,
+    create_file,
+    edit_file,
+    edit_file_lines,
+    apply_patch,
+    delete_file,
+    list_directory,
+    make_directory,
+    move_file,
+    copy_file,
+    search_files,
+    file_info,
+)
+from src.tools.web import (
+    build_web_tools,
+    web_search,
+    fetch_url,
+    get_cve_details,
+)
 
 __all__ = [
     "CONSULT_TOOL_NAME",
@@ -44,4 +66,22 @@ __all__ = [
     "ExecutionResult",
     "execute_kali_command",
     "parse_command",
+    "build_filesystem_tools",
+    "read_file",
+    "write_file",
+    "create_file",
+    "edit_file",
+    "edit_file_lines",
+    "apply_patch",
+    "delete_file",
+    "list_directory",
+    "make_directory",
+    "move_file",
+    "copy_file",
+    "search_files",
+    "file_info",
+    "build_web_tools",
+    "web_search",
+    "fetch_url",
+    "get_cve_details",
 ]

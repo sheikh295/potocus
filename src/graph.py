@@ -44,6 +44,8 @@ from src.tools.terminal import (
     TOOL_NAME as EXECUTE_TOOL_NAME,
     execute_kali_command,
 )
+from src.tools.filesystem import build_filesystem_tools
+from src.tools.web import build_web_tools
 from src.utils.llm_display import extract_reasoning, messages_to_events
 from src.utils.output_parser import format_parse_for_llm, parse_tool_output
 from src.workspace.manager import EngagementPhase, Workspace
@@ -369,11 +371,21 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
             lines.append(str(hit))
         return "\n".join(lines)
 
+    extra_tools: list[BaseTool] = []
+    try:
+        extra_tools.extend(build_filesystem_tools(runtime))
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to build filesystem tools")
+    try:
+        extra_tools.extend(build_web_tools(runtime))
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to build web tools")
     return [
         search_kali_tools_tool,
         execute_kali_command_tool,
         search_past_engagements_tool,
         consult_security_expert_tool,
+        *extra_tools,
     ]
 
 
