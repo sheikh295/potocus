@@ -25,14 +25,21 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
+from langgraph.types import Command
+
 from src.models import get_model_endpoints
 from src.prompts import ORCHESTRATOR_SYSTEM_PROMPT
 from src.tools.expert import (
-    TOOL_NAME,
+    TOOL_NAME as CONSULT_TOOL_NAME,
     SpecialistBudget,
     consult_security_expert,
 )
+from src.tools.terminal import (
+    TOOL_NAME as EXECUTE_TOOL_NAME,
+    execute_kali_command,
+)
 from src.workspace.manager import EngagementPhase, Workspace
+from src.workspace.scope_guard import ScopeGuard
 
 logger = logging.getLogger("potocus.graph")
 
@@ -60,9 +67,20 @@ class GraphRuntime:
     orchestrator_model: str
     specialist_model: str
     budget: SpecialistBudget
+    scope_guard: ScopeGuard
+    seen_targets: list[str] = field(default_factory=list)
+    tier2_confirmed: bool = False
     context_token_limit: int = 8000
     keep_recent_messages: int = 8
+    command_timeout_seconds: float = 120.0
     _db_conn: sqlite3.Connection | None = field(default=None, repr=False)
+
+    @property
+    def raw_output_dir(self) -> Path:
+        """Session directory for full unsummarized tool stdout/stderr."""
+        path = self.workspace.sessions_dir / self.session_id / "raw_output"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 
 def estimate_tokens(messages: Sequence[BaseMessage | dict[str, Any]]) -> int:
@@ -98,11 +116,12 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
         f"Mode: {ws.mode}\n"
         f"Phase: {phase}\n"
         f"Pacing: {ws.pacing}\n"
-        f"Available tools: {TOOL_NAME} "
+        f"Available tools:\n"
+        f"- {EXECUTE_TOOL_NAME}: run a host CLI command (argv string). "
+        "ScopeGuard + risk HITL gate execution in code.\n"
+        f"- {CONSULT_TOOL_NAME}: deep CVE/exploit analysis via the specialist "
         f"(at most {runtime.budget.max_calls_per_turn} call(s) per reasoning step).\n"
-        "When you need deep offensive/CVE/exploit analysis, call "
-        f"{TOOL_NAME}. Otherwise answer directly.\n"
-        "Do not invent tool results. Scope and HITL are enforced outside the model."
+        "Do not invent tool results. Never ask the operator to bypass scope or HITL."
     )
 
 
@@ -120,13 +139,9 @@ def _make_llm(model: str, temperature: float) -> ChatOpenAI:
 
 
 def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
-    """
-    Build the tool set available to the orchestrator for this session.
+    """Build the tool set available to the orchestrator for this session."""
 
-    Phase 4 ships ``consult_security_expert``. Terminal execution lands next.
-    """
-
-    @tool(TOOL_NAME)
+    @tool(CONSULT_TOOL_NAME)
     def consult_security_expert_tool(query: str, context: str = "") -> str:
         """
         Consult the offensive-security specialist (Dolphin3-Cyber) for deep CVE
@@ -144,7 +159,7 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
         )
         logger.info(
             "%s capped=%s calls=%s/%s",
-            TOOL_NAME,
+            CONSULT_TOOL_NAME,
             result.capped,
             result.calls_this_turn,
             result.max_calls_per_turn,
@@ -156,7 +171,48 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
             )
         return result.answer
 
-    return [consult_security_expert_tool]
+    @tool(EXECUTE_TOOL_NAME)
+    def execute_kali_command_tool(
+        command: str,
+        timeout_seconds: float = 120.0,
+        background: bool = False,
+    ) -> str:
+        """
+        Execute a host CLI command through ScopeGuard and risk-tier HITL.
+
+        Pass the full command as a single string (e.g. ``nmap -sn 10.10.20.0/24``).
+        Do not use shell metacharacters; arguments are parsed safely without a shell.
+
+        Args:
+            command: The command line to run.
+            timeout_seconds: Max seconds before the process is killed (foreground).
+            background: If true, start the process and return immediately with a pid.
+        """
+        timeout = timeout_seconds or runtime.command_timeout_seconds
+
+        def _mark_targets(targets: list[str]) -> None:
+            for target in targets:
+                if target not in runtime.seen_targets:
+                    runtime.seen_targets.append(target)
+
+        def _mark_tier2() -> None:
+            runtime.tier2_confirmed = True
+
+        result = execute_kali_command(
+            command,
+            scope_guard=runtime.scope_guard,
+            mode=runtime.workspace.mode,
+            seen_targets=list(runtime.seen_targets),
+            tier2_confirmed=runtime.tier2_confirmed,
+            raw_output_dir=runtime.raw_output_dir,
+            timeout_seconds=float(timeout),
+            background=bool(background),
+            on_targets_seen=_mark_targets,
+            on_tier2_confirmed=_mark_tier2,
+        )
+        return result.as_tool_text()
+
+    return [execute_kali_command_tool, consult_security_expert_tool]
 
 
 def _checkpoint_path(workspace: Workspace, session_id: str) -> Path:
@@ -237,6 +293,12 @@ def build_graph(runtime: GraphRuntime) -> Any:
         runtime.budget.reset_turn()
         phase = str(state.get("phase") or runtime.phase)
         runtime.phase = phase
+        # Union checkpointed gates with anything tools mutated on the runtime.
+        merged_targets = list(
+            dict.fromkeys([*(state.get("seen_targets") or []), *runtime.seen_targets])
+        )
+        runtime.seen_targets = merged_targets
+        runtime.tier2_confirmed = bool(state.get("tier2_confirmed")) or runtime.tier2_confirmed
 
         llm = _make_llm(runtime.orchestrator_model, endpoints.temperature).bind_tools(
             tools
@@ -255,6 +317,8 @@ def build_graph(runtime: GraphRuntime) -> Any:
             "specialist_calls_this_turn": runtime.budget.calls_this_turn,
             "context_tokens_approx": estimate_tokens(all_for_estimate),
             "phase": phase,
+            "seen_targets": list(runtime.seen_targets),
+            "tier2_confirmed": runtime.tier2_confirmed,
         }
 
     graph = StateGraph(AgentState)
@@ -291,11 +355,24 @@ class PotocusAgent:
         """Invoke/stream config with checkpoint thread id."""
         return {"configurable": {"thread_id": self.thread_id}}
 
-    def invoke_turn(self, user_text: str) -> AgentState:
-        """
-        Run one operator turn through the ReAct graph.
+    def pending_interrupts(self) -> list[Any]:
+        """Return outstanding HITL interrupt payloads for this thread."""
+        snap = self.graph.get_state(self.config())
+        return list(getattr(snap, "interrupts", ()) or ())
 
-        Persists checkpoint state under the session's checkpoints directory.
+    def invoke_turn(
+        self,
+        user_text: str,
+        *,
+        hitl_callback: Any | None = None,
+    ) -> AgentState:
+        """
+        Run one operator turn through the ReAct graph, resolving HITL interrupts.
+
+        ``hitl_callback`` receives the interrupt payload dict and must return
+        ``\"approve\"`` or ``\"deny\"``. When omitted, interrupts surface to the
+        caller via ``pending_interrupts()`` after a partial invoke (tests may
+        resume manually with ``resume``).
         """
         text = user_text.strip()
         if not text:
@@ -307,11 +384,44 @@ class PotocusAgent:
             "workspace_root": str(self.runtime.workspace.root),
             "session_id": self.runtime.session_id,
             "specialist_calls_this_turn": 0,
-            "seen_targets": [],
-            "tier2_confirmed": False,
+            "seen_targets": list(self.runtime.seen_targets),
+            "tier2_confirmed": self.runtime.tier2_confirmed,
         }
         result = self.graph.invoke(payload, config=self.config())
-        return result  # type: ignore[return-value]
+        return self._drain_interrupts(result, hitl_callback=hitl_callback)
+
+    def resume(self, decision: str, *, hitl_callback: Any | None = None) -> AgentState:
+        """Resume after a HITL interrupt with ``approve`` / ``deny``."""
+        result = self.graph.invoke(Command(resume=decision), config=self.config())
+        return self._drain_interrupts(result, hitl_callback=hitl_callback)
+
+    def _drain_interrupts(
+        self,
+        result: dict[str, Any] | AgentState,
+        *,
+        hitl_callback: Any | None,
+    ) -> AgentState:
+        """Keep resuming while HITL interrupts are pending and a callback exists."""
+        current: dict[str, Any] = dict(result)  # type: ignore[arg-type]
+        while True:
+            interrupts = self.pending_interrupts()
+            if not interrupts:
+                # Sync runtime from final state.
+                self.runtime.seen_targets = list(current.get("seen_targets") or self.runtime.seen_targets)
+                self.runtime.tier2_confirmed = bool(
+                    current.get("tier2_confirmed", self.runtime.tier2_confirmed)
+                )
+                return current  # type: ignore[return-value]
+            if hitl_callback is None:
+                return current  # type: ignore[return-value]
+            payload = interrupts[0].value
+            if not isinstance(payload, dict):
+                payload = {"raw": payload}
+            decision = hitl_callback(payload)
+            current = self.graph.invoke(
+                Command(resume=decision),
+                config=self.config(),
+            )
 
     def latest_ai_text(self, state: AgentState) -> str:
         """Return the latest non-tool AI message content."""
@@ -360,6 +470,12 @@ def create_agent(
         else int(agent_cfg.get("context_token_limit", 8000))
     )
     keep_recent = int(agent_cfg.get("keep_recent_messages", 8))
+    cmd_timeout = float(agent_cfg.get("command_timeout_seconds", 120))
+
+    scope_guard = ScopeGuard.from_workspace(
+        mode=workspace.mode,
+        scope_yaml=workspace.scope_yaml if workspace.mode == "scoped" else None,
+    )
 
     runtime = GraphRuntime(
         workspace=workspace,
@@ -368,8 +484,10 @@ def create_agent(
         orchestrator_model=workspace.models.get("orchestrator") or endpoints.orchestrator,
         specialist_model=workspace.models.get("specialist") or endpoints.specialist,
         budget=SpecialistBudget(max_calls_per_turn=endpoints.specialist_calls_per_turn),
+        scope_guard=scope_guard,
         context_token_limit=limit,
         keep_recent_messages=keep_recent,
+        command_timeout_seconds=cmd_timeout,
     )
     compiled = build_graph(runtime)
     return PotocusAgent(runtime=runtime, graph=compiled)

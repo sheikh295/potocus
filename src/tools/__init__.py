@@ -1,7 +1,7 @@
 """Potocus tools package."""
 
 from src.tools.expert import (
-    TOOL_NAME,
+    TOOL_NAME as CONSULT_TOOL_NAME,
     ConsultResult,
     SpecialistBudget,
     SpecialistBudgetExceeded,
@@ -14,9 +14,16 @@ from src.tools.risk_classification import (
     classify_command,
     tier_requires_hitl,
 )
+from src.tools.terminal import (
+    TOOL_NAME as EXECUTE_TOOL_NAME,
+    ExecutionResult,
+    execute_kali_command,
+    parse_command,
+)
 
 __all__ = [
-    "TOOL_NAME",
+    "CONSULT_TOOL_NAME",
+    "EXECUTE_TOOL_NAME",
     "ConsultResult",
     "SpecialistBudget",
     "SpecialistBudgetExceeded",
@@ -26,4 +33,7 @@ __all__ = [
     "RiskTier",
     "classify_command",
     "tier_requires_hitl",
+    "ExecutionResult",
+    "execute_kali_command",
+    "parse_command",
 ]

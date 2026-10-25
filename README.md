@@ -73,7 +73,7 @@ potocus chat
 | `potocus workspace` | init / switch / show / set-mode |
 | `potocus scope` | add / remove / list / check |
 | `potocus session` | new / list / resume / rename / close / set-phase |
-| `potocus chat` | LangGraph ReAct REPL (checkpointed per session) |
+| `potocus chat` | LangGraph ReAct REPL + HITL panels for risky commands |
 | `potocus status` | workspace / session / phase / mode |
 | `potocus config` | show / test-ollama / classify / consult |
 

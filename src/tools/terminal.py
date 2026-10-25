@@ -1,0 +1,335 @@
+"""``execute_kali_command`` — subprocess execution gated by ScopeGuard + risk HITL."""
+
+from __future__ import annotations
+
+import logging
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+from langgraph.types import interrupt
+
+from src.tools.risk_classification import (
+    ClassificationResult,
+    RiskTier,
+    classify_command,
+    tier_requires_hitl,
+)
+from src.workspace.scope_guard import ScopeCheckResult, ScopeGuard, extract_targets_from_command
+
+logger = logging.getLogger("potocus.terminal")
+
+TOOL_NAME = "execute_kali_command"
+
+HitlDecision = Literal["approve", "deny"]
+HitlCallback = Callable[[dict[str, Any]], HitlDecision]
+
+
+class CommandBlockedError(Exception):
+    """Raised when a command is blocked by scope (not used for HITL deny)."""
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    """Structured result of a gated command execution attempt."""
+
+    status: Literal["ok", "blocked_scope", "denied_hitl", "timeout", "error", "started"]
+    command: list[str]
+    tier: RiskTier
+    tier_reason: str
+    scope: ScopeCheckResult
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int | None = None
+    raw_output_path: str | None = None
+    pid: int | None = None
+    message: str = ""
+
+    def as_tool_text(self, *, max_chars: int = 8000) -> str:
+        """Format a compact string for the orchestrator context window."""
+        lines = [
+            f"status={self.status}",
+            f"command={shlex.join(self.command)}",
+            f"tier={self.tier.value} ({self.tier_reason})",
+            f"scope={self.scope.decision}: {self.scope.reason}",
+        ]
+        if self.scope.targets:
+            lines.append(f"targets={', '.join(self.scope.targets)}")
+        if self.exit_code is not None:
+            lines.append(f"exit_code={self.exit_code}")
+        if self.pid is not None:
+            lines.append(f"pid={self.pid}")
+        if self.raw_output_path:
+            lines.append(f"raw_output={self.raw_output_path}")
+        if self.message:
+            lines.append(f"message={self.message}")
+
+        def _clip(label: str, text: str) -> str:
+            text = text or ""
+            if len(text) > max_chars // 2:
+                return f"{label} (truncated):\n{text[: max_chars // 2]}\n… [{len(text)} chars total]"
+            return f"{label}:\n{text}" if text else f"{label}: (empty)"
+
+        if self.status in {"ok", "error", "timeout"}:
+            lines.append(_clip("stdout", self.stdout))
+            lines.append(_clip("stderr", self.stderr))
+        return "\n".join(lines)
+
+
+def parse_command(command: str | list[str]) -> list[str]:
+    """
+    Parse a command into argv for ``subprocess`` with ``shell=False``.
+
+    Strings are split with ``shlex`` (POSIX). Empty commands raise ValueError.
+    """
+    if isinstance(command, list):
+        argv = [str(part) for part in command if str(part).strip() != ""]
+    else:
+        argv = shlex.split(command, posix=True)
+    if not argv:
+        raise ValueError(f"{TOOL_NAME} requires a non-empty command")
+    return argv
+
+
+def _write_raw_output(
+    raw_dir: Path,
+    *,
+    argv: list[str],
+    stdout: str,
+    stderr: str,
+    exit_code: int | None,
+    status: str,
+) -> Path:
+    """Persist full stdout/stderr under the session raw_output directory."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = raw_dir / f"{stamp}_{argv[0].replace('/', '_')}.txt"
+    body = (
+        f"status={status}\n"
+        f"command={shlex.join(argv)}\n"
+        f"exit_code={exit_code}\n"
+        f"{'=' * 60}\nSTDOUT\n{'=' * 60}\n{stdout}\n"
+        f"{'=' * 60}\nSTDERR\n{'=' * 60}\n{stderr}\n"
+    )
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _hitl_via_interrupt(payload: dict[str, Any]) -> HitlDecision:
+    """Pause the graph and wait for an operator resume value."""
+    decision = interrupt(payload)
+    if decision in ("approve", "deny"):
+        return decision  # type: ignore[return-value]
+    # Accept common truthy affirmatives from CLI / tests.
+    if isinstance(decision, str) and decision.strip().lower() in {"y", "yes", "approve"}:
+        return "approve"
+    return "deny"
+
+
+def execute_kali_command(
+    command: str | list[str],
+    *,
+    scope_guard: ScopeGuard,
+    mode: str,
+    seen_targets: list[str],
+    tier2_confirmed: bool,
+    raw_output_dir: Path,
+    timeout_seconds: float = 120.0,
+    background: bool = False,
+    hitl: HitlCallback | None = None,
+    on_targets_seen: Callable[[list[str]], None] | None = None,
+    on_tier2_confirmed: Callable[[], None] | None = None,
+) -> ExecutionResult:
+    """
+    Gate and execute a host command for the agent.
+
+    Order of controls (all in Python — never delegated to the LLM):
+      1. Parse argv (``shell=False``)
+      2. ScopeGuard — block out-of-scope targets
+      3. Risk classification — Tier 1/2/3
+      4. New-target escalation — first touch of an in-scope host still needs HITL
+      5. HITL interrupt when required
+      6. ``subprocess.run`` / ``Popen`` execution
+      7. Full raw output archival; truncated text returned to the model
+    """
+    argv = parse_command(command)
+    classification: ClassificationResult = classify_command(argv)
+    scope = scope_guard.check_command(argv)
+
+    if scope.decision == "block":
+        logger.warning("scope block cmd=%s reason=%s", argv, scope.reason)
+        return ExecutionResult(
+            status="blocked_scope",
+            command=argv,
+            tier=classification.tier,
+            tier_reason=classification.reason,
+            scope=scope,
+            message=scope.reason,
+        )
+
+    targets = list(scope.targets) or list(extract_targets_from_command(argv))
+    new_targets = [t for t in targets if t not in seen_targets]
+    needs_hitl = tier_requires_hitl(
+        classification.tier,
+        mode=mode,
+        first_tier2_in_session=(not tier2_confirmed),
+    ) or bool(new_targets)
+
+    hitl_reason = classification.reason
+    if new_targets and not tier_requires_hitl(
+        classification.tier, mode=mode, first_tier2_in_session=(not tier2_confirmed)
+    ):
+        hitl_reason = f"new target(s) not previously acted on: {', '.join(new_targets)}"
+
+    if needs_hitl:
+        payload = {
+            "type": "hitl_confirmation",
+            "tool": TOOL_NAME,
+            "command": argv,
+            "command_display": shlex.join(argv),
+            "tier": classification.tier.value,
+            "tier_name": classification.tier.name,
+            "tier_reason": hitl_reason,
+            "matched_rule": classification.matched_rule,
+            "targets": targets,
+            "new_targets": new_targets,
+            "scope_decision": scope.decision,
+            "scope_reason": scope.reason,
+            "mode": mode,
+            "background": background,
+            "timeout_seconds": timeout_seconds,
+        }
+        callback = hitl or _hitl_via_interrupt
+        decision = callback(payload)
+        if decision != "approve":
+            logger.info("HITL deny cmd=%s", argv)
+            return ExecutionResult(
+                status="denied_hitl",
+                command=argv,
+                tier=classification.tier,
+                tier_reason=hitl_reason,
+                scope=scope,
+                message="Operator denied execution",
+            )
+        if classification.tier == RiskTier.TIER_2_ACTIVE and on_tier2_confirmed:
+            on_tier2_confirmed()
+
+    def _mark_seen() -> None:
+        if on_targets_seen and targets:
+            on_targets_seen(targets)
+
+    if background:
+        log_path = raw_output_dir / f"bg_{int(time.time())}_{argv[0].replace('/', '_')}.log"
+        raw_output_dir.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("w", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(  # noqa: S603 — argv list, shell=False
+                argv,
+                shell=False,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except OSError as exc:
+            log_handle.close()
+            return ExecutionResult(
+                status="error",
+                command=argv,
+                tier=classification.tier,
+                tier_reason=classification.reason,
+                scope=scope,
+                message=f"failed to start: {exc}",
+            )
+        _mark_seen()
+        logger.info("background start pid=%s cmd=%s log=%s", proc.pid, argv, log_path)
+        return ExecutionResult(
+            status="started",
+            command=argv,
+            tier=classification.tier,
+            tier_reason=classification.reason,
+            scope=scope,
+            pid=proc.pid,
+            raw_output_path=str(log_path),
+            message=f"background process started; output → {log_path}",
+        )
+
+    try:
+        completed = subprocess.run(  # noqa: S603 — argv list, shell=False
+            argv,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        raw_path = _write_raw_output(
+            raw_output_dir,
+            argv=argv,
+            stdout=stdout,
+            stderr=stderr or f"timed out after {timeout_seconds}s",
+            exit_code=None,
+            status="timeout",
+        )
+        _mark_seen()
+        return ExecutionResult(
+            status="timeout",
+            command=argv,
+            tier=classification.tier,
+            tier_reason=classification.reason,
+            scope=scope,
+            stdout=stdout,
+            stderr=stderr or f"timed out after {timeout_seconds}s",
+            raw_output_path=str(raw_path),
+            message=f"command timed out after {timeout_seconds}s",
+        )
+    except OSError as exc:
+        _mark_seen()
+        return ExecutionResult(
+            status="error",
+            command=argv,
+            tier=classification.tier,
+            tier_reason=classification.reason,
+            scope=scope,
+            message=f"execution error: {exc}",
+        )
+
+    raw_path = _write_raw_output(
+        raw_output_dir,
+        argv=argv,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        exit_code=completed.returncode,
+        status="ok" if completed.returncode == 0 else "error",
+    )
+    _mark_seen()
+
+    status: Literal["ok", "error"] = "ok" if completed.returncode == 0 else "error"
+    logger.info(
+        "executed status=%s code=%s cmd=%s raw=%s",
+        status,
+        completed.returncode,
+        argv,
+        raw_path,
+    )
+    return ExecutionResult(
+        status=status,
+        command=argv,
+        tier=classification.tier,
+        tier_reason=classification.reason,
+        scope=scope,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        exit_code=completed.returncode,
+        raw_output_path=str(raw_path),
+    )

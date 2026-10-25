@@ -23,6 +23,7 @@ agent:
   # Approximate token ceiling before the compact node summarizes older turns (§10).
   context_token_limit: 8000
   keep_recent_messages: 8
+  command_timeout_seconds: 120
 
 # Active context pointers (updated by `workspace switch` / `session` commands).
 # Paths are absolute or relative to the machine running the harness.

@@ -12,9 +12,11 @@ from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Prompt
 
-from src.graph import PotocusAgent, create_agent
-from src.tools.expert import TOOL_NAME
+from src.graph import PotocusAgent, create_agent, valid_phases
+from src.tools.expert import TOOL_NAME as CONSULT_TOOL_NAME
+from src.tools.terminal import TOOL_NAME as EXECUTE_TOOL_NAME
 from src.utils.config import (
     GLOBAL_STATE_DIR,
     get_active_session_id,
@@ -47,10 +49,37 @@ def _save_session_phase(workspace, session_id: str, phase: str) -> None:
         yaml.safe_dump(meta, handle, default_flow_style=False, sort_keys=False)
 
 
+def _hitl_prompt(payload: dict[str, Any]) -> str:
+    """Render a Rich HITL panel and return approve/deny."""
+    tier = str(payload.get("tier_name") or payload.get("tier") or "?")
+    color = "red" if "3" in str(payload.get("tier", "")) or "EXPLOIT" in tier else "yellow"
+    lines = [
+        f"[bold]{payload.get('tool', EXECUTE_TOOL_NAME)}[/bold]",
+        f"command: [white]{payload.get('command_display') or payload.get('command')}[/white]",
+        f"tier: [{color}]{tier}[/{color}] — {payload.get('tier_reason', '')}",
+        f"mode: {payload.get('mode')}",
+        f"scope: {payload.get('scope_decision')} — {payload.get('scope_reason', '')}",
+    ]
+    targets = payload.get("targets") or []
+    new_targets = payload.get("new_targets") or []
+    if targets:
+        lines.append(f"targets: {', '.join(map(str, targets))}")
+    if new_targets:
+        lines.append(f"[yellow]new targets:[/yellow] {', '.join(map(str, new_targets))}")
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="HITL confirmation required",
+            border_style=color,
+        )
+    )
+    answer = Prompt.ask("Allow execution?", choices=["y", "n"], default="n")
+    return "approve" if answer.lower() == "y" else "deny"
+
+
 def _print_turn(agent: PotocusAgent, state: dict[str, Any], user_text: str) -> None:
     """Render tool calls and the final assistant reply for this turn."""
     messages = list(state.get("messages") or [])
-    # Walk backward to the HumanMessage for this turn, then print what followed.
     start = 0
     for idx in range(len(messages) - 1, -1, -1):
         msg = messages[idx]
@@ -71,11 +100,16 @@ def _print_turn(agent: PotocusAgent, state: dict[str, Any], user_text: str) -> N
                     )
                 )
         elif isinstance(msg, ToolMessage):
-            border = "yellow" if "BUDGET_EXCEEDED" in (msg.content or "") else "magenta"
+            content = str(msg.content)
+            border = "yellow" if (
+                "BUDGET_EXCEEDED" in content
+                or "blocked_scope" in content
+                or "denied_hitl" in content
+            ) else "magenta"
             console.print(
                 Panel(
-                    Markdown(str(msg.content)),
-                    title=f"tool result · {msg.name or TOOL_NAME}",
+                    Markdown(content),
+                    title=f"tool result · {msg.name or CONSULT_TOOL_NAME}",
                     border_style=border,
                 )
             )
@@ -94,7 +128,7 @@ def chat(ctx: typer.Context) -> None:
     """
     Start the Potocus LangGraph ReAct loop for the active workspace/session.
 
-    State is checkpointed under ``.potocus/sessions/<id>/checkpoints/``.
+    Destructive / Tier-3 (and new-target) commands pause for inline HITL.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -135,6 +169,7 @@ def chat(ctx: typer.Context) -> None:
             f"phase: {phase}\n"
             f"orchestrator: {agent.runtime.orchestrator_model}\n"
             f"specialist:   {agent.runtime.specialist_model}\n"
+            f"tools: {EXECUTE_TOOL_NAME}, {CONSULT_TOOL_NAME}\n"
             f"context budget: {agent.runtime.context_token_limit} tokens (approx)\n"
             "[dim]Commands: /exit  /status  /phase <NAME>[/dim]",
             title="Potocus Chat (LangGraph)",
@@ -170,7 +205,8 @@ def chat(ctx: typer.Context) -> None:
                     f"specialist_this_turn="
                     f"{values.get('specialist_calls_this_turn', 0)}/"
                     f"{agent.runtime.budget.max_calls_per_turn} "
-                    f"cap_hits={agent.runtime.budget.cap_hits} "
+                    f"tier2_confirmed={agent.runtime.tier2_confirmed} "
+                    f"seen_targets={agent.runtime.seen_targets} "
                     f"messages={len(values.get('messages') or [])}"
                 )
                 continue
@@ -180,21 +216,18 @@ def chat(ctx: typer.Context) -> None:
                     console.print("[yellow]Usage:[/yellow] /phase RECON|ENUMERATION|...")
                     continue
                 new_phase = parts[1].strip().upper()
-                from src.graph import valid_phases
-
                 if new_phase not in valid_phases():
                     console.print(f"[red]Invalid phase.[/red] Choose from {valid_phases()}")
                     continue
                 agent.runtime.phase = new_phase
                 _save_session_phase(workspace, session_id, new_phase)
-                # Persist phase into checkpointed state.
                 agent.graph.update_state(agent.config(), {"phase": new_phase})
                 console.print(f"[green]Phase set to[/green] {new_phase}")
                 continue
 
+            console.print("[dim]agent loop…[/dim]")
             try:
-                with console.status("[dim]agent loop…[/dim]", spinner="dots"):
-                    state = agent.invoke_turn(user_text)
+                state = agent.invoke_turn(user_text, hitl_callback=_hitl_prompt)
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[red]Agent error:[/red] {exc}")
                 continue

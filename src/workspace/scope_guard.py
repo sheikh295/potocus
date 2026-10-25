@@ -132,17 +132,18 @@ def _candidates_from_token(token: str) -> list[str]:
         if match.lower() not in {h.lower() for h in hits}:
             hits.append(match.lower())
 
-    # Bare short hostname token (e.g. "dc01") — only if the whole token looks like a host.
+    # Bare hostname tokens must look domain-like (contain a dot). This avoids
+    # treating tool subcommands like ``version`` / ``dir`` as network targets.
     stripped = value.strip().strip("'\"")
     if (
         not hits
-        and _SIMPLE_HOST_RE.match(stripped)
+        and "." in stripped
+        and "/" not in stripped
         and not stripped.startswith("-")
-        and "/" not in stripped  # avoid paths
+        and _SIMPLE_HOST_RE.match(stripped)
+        and not stripped.endswith((".txt", ".lst", ".json", ".xml", ".csv", ".log"))
     ):
-        # Avoid classifying obvious local filenames.
-        if "." in stripped or stripped.replace("-", "").isalnum():
-            hits.append(stripped.lower())
+        hits.append(stripped.lower())
 
     return hits
 
