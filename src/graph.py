@@ -79,10 +79,17 @@ class GraphRuntime:
     findings_db: FindingsDB
     seen_targets: list[str] = field(default_factory=list)
     tier2_confirmed: bool = False
+    pacing_override: str | None = None
+    target_focus: str = ""
     context_token_limit: int = 8000
     keep_recent_messages: int = 8
     command_timeout_seconds: float = 120.0
     _db_conn: sqlite3.Connection | None = field(default=None, repr=False)
+
+    @property
+    def effective_pacing(self) -> str:
+        """Session pacing override, else workspace default."""
+        return self.pacing_override or self.workspace.pacing
 
     @property
     def raw_output_dir(self) -> Path:
@@ -124,7 +131,8 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
         f"Workspace: {ws.name}\n"
         f"Mode: {ws.mode}\n"
         f"Phase: {phase}\n"
-        f"Pacing: {ws.pacing}\n"
+        f"Pacing: {runtime.effective_pacing}\n"
+        f"Target focus: {runtime.target_focus or '(none)'}\n"
         f"Available tools:\n"
         f"- {SEARCH_TOOLS_NAME}: find the right Kali tool and usage from manuals "
         "(call this when unsure which binary/flags to use).\n"
@@ -521,11 +529,15 @@ def create_agent(
     session_id: str,
     phase: str | EngagementPhase | None = None,
     context_token_limit: int | None = None,
+    pacing_override: str | None = None,
+    target_focus: str | None = None,
 ) -> PotocusAgent:
     """
     Create a compiled Potocus agent for a workspace session.
 
     Model names prefer workspace.yaml overrides, then global config.
+    When ``pacing_override`` / ``target_focus`` are omitted, values are loaded
+    from ``session.yaml`` when present.
     """
     endpoints = get_model_endpoints()
     resolved_phase = (
@@ -534,6 +546,15 @@ def create_agent(
         else (phase or EngagementPhase.RECON.value)
     )
     from src.utils.config import load_global_config
+    from src.workspace.session_store import read_session_meta
+
+    session_meta: dict[str, Any] = {}
+    try:
+        session_meta = read_session_meta(workspace, session_id)
+        if phase is None and session_meta.get("phase"):
+            resolved_phase = str(session_meta["phase"])
+    except FileNotFoundError:
+        session_meta = {}
 
     cfg = load_global_config()
     agent_cfg = cfg.get("agent", {})
@@ -562,6 +583,14 @@ def create_agent(
         scope_guard=scope_guard,
         vectorstore=vectorstore,
         findings_db=findings_db,
+        pacing_override=pacing_override
+        if pacing_override is not None
+        else (str(session_meta["pacing"]) if session_meta.get("pacing") else None),
+        target_focus=(
+            target_focus
+            if target_focus is not None
+            else str(session_meta.get("target_focus") or "")
+        ),
         context_token_limit=limit,
         keep_recent_messages=keep_recent,
         command_timeout_seconds=cmd_timeout,

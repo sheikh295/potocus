@@ -1,4 +1,4 @@
-"""``potocus session`` — create, list, activate, rename, and close sessions."""
+"""``potocus session`` — multi-session lifecycle with checkpoint resume."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from typing import Optional
 from uuid import uuid4
 
 import typer
-import yaml
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from src.utils.config import (
@@ -17,8 +17,17 @@ from src.utils.config import (
     set_active_session,
 )
 from src.workspace.manager import EngagementPhase, WorkspaceError, load_workspace
+from src.workspace.session_store import (
+    inspect_checkpoint,
+    list_session_ids,
+    read_session_meta,
+    session_yaml_path,
+    sync_meta_from_checkpoint,
+    touch_session,
+    write_session_meta,
+)
 
-app = typer.Typer(help="Create, list, resume, rename, and close sessions.")
+app = typer.Typer(help="Create, list, resume, and manage sessions (checkpointed).")
 console = Console()
 
 
@@ -35,18 +44,13 @@ def _require_workspace():
         raise typer.Exit(code=1) from exc
 
 
-def _write_session_yaml(path, data: dict) -> None:
-    """Write session.yaml."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(data, handle, default_flow_style=False, sort_keys=False)
-
-
-def _read_session_yaml(path) -> dict:
-    """Read session.yaml."""
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
-    return data if isinstance(data, dict) else {}
+def _valid_phase(phase: str) -> str:
+    """Validate engagement phase name."""
+    valid = {p.value for p in EngagementPhase}
+    if phase not in valid:
+        console.print(f"[red]Invalid phase:[/red] {phase}. Choose from {sorted(valid)}")
+        raise typer.Exit(code=1)
+    return phase
 
 
 @app.command("new")
@@ -57,18 +61,16 @@ def session_new(
         "--phase",
         help="Starting engagement phase.",
     ),
+    focus: str = typer.Option("", "--focus", help="Optional target focus note."),
 ) -> None:
     """Create a new session in the active workspace and set it active."""
     workspace = _require_workspace()
-    valid_phases = {p.value for p in EngagementPhase}
-    if phase not in valid_phases:
-        console.print(f"[red]Invalid phase:[/red] {phase}. Choose from {sorted(valid_phases)}")
-        raise typer.Exit(code=1)
+    phase = _valid_phase(phase)
 
     session_id = uuid4().hex[:12]
-    session_dir = workspace.sessions_dir / session_id
-    (session_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-    (session_dir / "raw_output").mkdir(parents=True, exist_ok=True)
+    session_path = session_yaml_path(workspace, session_id)
+    (session_path.parent / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (session_path.parent / "raw_output").mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc).isoformat()
     meta = {
@@ -77,14 +79,17 @@ def session_new(
         "created_at": now,
         "updated_at": now,
         "phase": phase,
-        "target_focus": "",
+        "target_focus": focus,
         "status": "open",
+        "message_count": 0,
+        "checkpoint_exists": False,
     }
-    _write_session_yaml(session_dir / "session.yaml", meta)
+    write_session_meta(workspace, session_id, meta)
     set_active_session(session_id)
     console.print(
         f"[green]Created session[/green] [bold]{name}[/bold] ({session_id}) "
         f"phase={phase}"
+        + (f" focus={focus!r}" if focus else "")
     )
 
 
@@ -92,17 +97,21 @@ def session_new(
 def session_list(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
-    """List sessions in the active workspace."""
+    """List sessions with phase, focus, and checkpoint message counts."""
     workspace = _require_workspace()
     active_id = get_active_session_id()
-    rows = []
-    for entry in sorted(workspace.sessions_dir.iterdir()):
-        meta_path = entry / "session.yaml"
-        if entry.is_dir() and meta_path.exists():
-            meta = _read_session_yaml(meta_path)
-            meta["id"] = entry.name
-            meta["active"] = entry.name == active_id
-            rows.append(meta)
+    rows: list[dict] = []
+    for session_id in list_session_ids(workspace):
+        meta = read_session_meta(workspace, session_id)
+        snap = inspect_checkpoint(workspace, session_id)
+        # Keep yaml message_count fresh without rewriting every list unless useful.
+        meta["active"] = session_id == active_id
+        meta["checkpoint_exists"] = snap.exists
+        meta["messages"] = snap.message_count
+        meta["pending_interrupt"] = snap.pending_interrupt
+        if snap.phase:
+            meta["phase"] = snap.phase
+        rows.append(meta)
 
     if json_out:
         console.print_json(data={"sessions": rows})
@@ -117,6 +126,9 @@ def session_list(
     table.add_column("ID")
     table.add_column("Name")
     table.add_column("Phase")
+    table.add_column("Focus")
+    table.add_column("Msgs")
+    table.add_column("CKPT")
     table.add_column("Status")
     table.add_column("Updated")
     for row in rows:
@@ -125,30 +137,88 @@ def session_list(
             str(row.get("id", "")),
             str(row.get("name", "")),
             str(row.get("phase", "")),
+            str(row.get("target_focus", "") or "")[:24],
+            str(row.get("messages", 0)),
+            "yes" if row.get("checkpoint_exists") else "no",
             str(row.get("status", "")),
             str(row.get("updated_at", "")),
         )
     console.print(table)
 
 
+@app.command("show")
+def session_show(
+    session_id: Optional[str] = typer.Argument(
+        None, help="Session id (default: active)."
+    ),
+) -> None:
+    """Show session metadata and checkpoint summary."""
+    workspace = _require_workspace()
+    target = session_id or get_active_session_id()
+    if not target:
+        console.print("[yellow]No session specified and none active.[/yellow]")
+        raise typer.Exit(code=1)
+    try:
+        meta = read_session_meta(workspace, target)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    snap = inspect_checkpoint(workspace, target)
+    console.print(
+        Panel.fit(
+            f"name: {meta.get('name')}\n"
+            f"id: {target}\n"
+            f"status: {meta.get('status')}\n"
+            f"phase: {snap.phase or meta.get('phase')}\n"
+            f"focus: {meta.get('target_focus') or '(none)'}\n"
+            f"pacing: {meta.get('pacing') or '(workspace default)'}\n"
+            f"messages: {snap.message_count}\n"
+            f"tokens≈: {snap.context_tokens_approx}\n"
+            f"seen_targets: {', '.join(snap.seen_targets) or '(none)'}\n"
+            f"tier2_confirmed: {snap.tier2_confirmed}\n"
+            f"pending_HITL: {snap.pending_interrupt}\n"
+            f"checkpoint: {snap.path or '(none)'}\n"
+            f"updated: {meta.get('updated_at')}",
+            title="Session",
+            border_style="cyan",
+        )
+    )
+
+
 @app.command("resume")
 def session_resume(
     session_id: str = typer.Argument(..., help="Session id to resume."),
 ) -> None:
-    """Activate an existing session in the current workspace."""
+    """
+    Activate a session and sync metadata from its LangGraph checkpoint.
+
+    Message history / phase / seen targets are restored automatically the next
+    time you enter ``potocus chat`` (same thread id).
+    """
     workspace = _require_workspace()
-    meta_path = workspace.sessions_dir / session_id / "session.yaml"
-    if not meta_path.exists():
-        console.print(f"[red]Unknown session:[/red] {session_id}")
-        raise typer.Exit(code=1)
-    meta = _read_session_yaml(meta_path)
-    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
-    meta["status"] = "open"
-    _write_session_yaml(meta_path, meta)
+    try:
+        meta, snap = sync_meta_from_checkpoint(workspace, session_id)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    meta = touch_session(workspace, session_id, status="open")
     set_active_session(session_id)
+
     console.print(
-        f"[green]Active session:[/green] {meta.get('name', session_id)} ({session_id}) "
-        f"phase={meta.get('phase')}"
+        Panel.fit(
+            f"[green]Resumed[/green] [bold]{meta.get('name', session_id)}[/bold] ({session_id})\n"
+            f"phase: {meta.get('phase')}\n"
+            f"focus: {meta.get('target_focus') or '(none)'}\n"
+            f"checkpoint: {'yes' if snap.exists else 'no (fresh thread)'}\n"
+            f"messages restored: {snap.message_count}\n"
+            f"tokens≈: {snap.context_tokens_approx}\n"
+            f"pending HITL: {snap.pending_interrupt}\n"
+            f"seen_targets: {', '.join(snap.seen_targets) or '(none)'}\n\n"
+            "[dim]Run `potocus chat` to continue this thread.[/dim]",
+            title="Session resume",
+            border_style="green",
+        )
     )
 
 
@@ -159,14 +229,11 @@ def session_rename(
 ) -> None:
     """Rename a session."""
     workspace = _require_workspace()
-    meta_path = workspace.sessions_dir / session_id / "session.yaml"
-    if not meta_path.exists():
-        console.print(f"[red]Unknown session:[/red] {session_id}")
-        raise typer.Exit(code=1)
-    meta = _read_session_yaml(meta_path)
-    meta["name"] = name
-    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_session_yaml(meta_path, meta)
+    try:
+        touch_session(workspace, session_id, name=name)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     console.print(f"[green]Renamed session[/green] {session_id} → {name}")
 
 
@@ -182,14 +249,11 @@ def session_close(
     if not target:
         console.print("[yellow]No session specified and none active.[/yellow]")
         raise typer.Exit(code=1)
-    meta_path = workspace.sessions_dir / target / "session.yaml"
-    if not meta_path.exists():
-        console.print(f"[red]Unknown session:[/red] {target}")
-        raise typer.Exit(code=1)
-    meta = _read_session_yaml(meta_path)
-    meta["status"] = "closed"
-    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_session_yaml(meta_path, meta)
+    try:
+        touch_session(workspace, target, status="closed")
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     if get_active_session_id() == target:
         set_active_session(None)
     console.print(f"[green]Closed session[/green] {target}")
@@ -200,23 +264,69 @@ def session_set_phase(
     phase: str = typer.Argument(..., help="Engagement phase name."),
     session_id: Optional[str] = typer.Option(None, "--session", help="Session id."),
 ) -> None:
-    """Manually advance or rewind the engagement phase for a session."""
+    """Advance/rewind phase in session.yaml and the LangGraph checkpoint."""
     workspace = _require_workspace()
-    valid_phases = {p.value for p in EngagementPhase}
-    if phase not in valid_phases:
-        console.print(f"[red]Invalid phase:[/red] {phase}. Choose from {sorted(valid_phases)}")
-        raise typer.Exit(code=1)
+    phase = _valid_phase(phase)
     target = session_id or get_active_session_id()
     if not target:
         console.print("[yellow]No session specified and none active.[/yellow]")
         raise typer.Exit(code=1)
-    meta_path = workspace.sessions_dir / target / "session.yaml"
-    if not meta_path.exists():
-        console.print(f"[red]Unknown session:[/red] {target}")
-        raise typer.Exit(code=1)
-    meta = _read_session_yaml(meta_path)
+    try:
+        meta = read_session_meta(workspace, target)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     old = meta.get("phase")
-    meta["phase"] = phase
-    meta["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_session_yaml(meta_path, meta)
+    touch_session(workspace, target, phase=phase)
+
+    # Persist into checkpoint so chat/resume see it immediately.
+    from src.graph import create_agent
+
+    agent = create_agent(workspace, session_id=target, phase=phase)
+    try:
+        agent.graph.update_state(agent.config(), {"phase": phase})
+    finally:
+        agent.close()
+
     console.print(f"[green]Phase[/green] {old} → {phase} (session {target})")
+
+
+@app.command("set-focus")
+def session_set_focus(
+    focus: str = typer.Argument(..., help="Target focus note for this session."),
+    session_id: Optional[str] = typer.Option(None, "--session", help="Session id."),
+) -> None:
+    """Set the session's target focus (shown in list/status/chat)."""
+    workspace = _require_workspace()
+    target = session_id or get_active_session_id()
+    if not target:
+        console.print("[yellow]No session specified and none active.[/yellow]")
+        raise typer.Exit(code=1)
+    try:
+        touch_session(workspace, target, target_focus=focus)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Focus set:[/green] {focus}")
+
+
+@app.command("set-pacing")
+def session_set_pacing(
+    pacing: str = typer.Argument(..., help="stealth | normal | aggressive"),
+    session_id: Optional[str] = typer.Option(None, "--session", help="Session id."),
+) -> None:
+    """Override pacing for this session without changing the workspace default."""
+    if pacing not in ("stealth", "normal", "aggressive"):
+        console.print("[red]Invalid pacing.[/red] Use stealth | normal | aggressive")
+        raise typer.Exit(code=1)
+    workspace = _require_workspace()
+    target = session_id or get_active_session_id()
+    if not target:
+        console.print("[yellow]No session specified and none active.[/yellow]")
+        raise typer.Exit(code=1)
+    try:
+        touch_session(workspace, target, pacing=pacing)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Session pacing:[/green] {pacing}")

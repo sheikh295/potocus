@@ -78,7 +78,7 @@ potocus chat
 |---|---|
 | `potocus workspace` | init / switch / show / set-mode |
 | `potocus scope` | add / remove / list / check |
-| `potocus session` | new / list / resume / rename / close / set-phase |
+| `potocus session` | new / list / show / resume / rename / close / set-phase / set-focus / set-pacing |
 | `potocus tools` | index / search / status (Kali manuals → ChromaDB) |
 | `potocus findings` | summary / hosts / services / list / search |
 | `potocus chat` | LangGraph ReAct REPL + HITL panels |

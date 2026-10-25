@@ -24,6 +24,7 @@ from src.utils.config import (
     get_active_workspace_path,
 )
 from src.workspace.manager import WorkspaceError, load_workspace
+from src.workspace.session_store import touch_session
 
 app = typer.Typer(help="Enter the interactive agent REPL for the active session.")
 console = Console()
@@ -161,13 +162,21 @@ def chat(ctx: typer.Context) -> None:
 
     phase = str(meta.get("phase") or "RECON")
     agent = create_agent(workspace, session_id=session_id, phase=phase)
+    # Reflect any already-checkpointed history in the banner.
+    snap = agent.graph.get_state(agent.config())
+    prior_msgs = len((snap.values or {}).get("messages") or []) if snap else 0
+    if snap and snap.values and snap.values.get("phase"):
+        phase = str(snap.values["phase"])
+        agent.runtime.phase = phase
 
     mode_style = "bold red" if workspace.mode == "scoped" else "bold yellow"
     console.print(
         Panel.fit(
             f"[{mode_style}]{workspace.mode.upper()}[/{mode_style}]  "
             f"{workspace.name}  ·  session {meta.get('name', session_id)} ({session_id})\n"
-            f"phase: {phase}\n"
+            f"phase: {phase}  ·  focus: {agent.runtime.target_focus or '(none)'}\n"
+            f"pacing: {agent.runtime.effective_pacing}\n"
+            f"checkpoint messages: {prior_msgs}\n"
             f"orchestrator: {agent.runtime.orchestrator_model}\n"
             f"specialist:   {agent.runtime.specialist_model}\n"
             f"tools: {SEARCH_TOOLS_NAME}, {EXECUTE_TOOL_NAME}, {CONSULT_TOOL_NAME}\n"
@@ -222,6 +231,7 @@ def chat(ctx: typer.Context) -> None:
                     continue
                 agent.runtime.phase = new_phase
                 _save_session_phase(workspace, session_id, new_phase)
+                touch_session(workspace, session_id, phase=new_phase)
                 agent.graph.update_state(agent.config(), {"phase": new_phase})
                 console.print(f"[green]Phase set to[/green] {new_phase}")
                 continue
@@ -233,6 +243,13 @@ def chat(ctx: typer.Context) -> None:
                 console.print(f"[red]Agent error:[/red] {exc}")
                 continue
 
+            touch_session(
+                workspace,
+                session_id,
+                phase=str(state.get("phase") or agent.runtime.phase),
+                message_count=len(state.get("messages") or []),
+                checkpoint_exists=True,
+            )
             _print_turn(agent, state, user_text)
     finally:
         agent.close()
