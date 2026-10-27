@@ -143,8 +143,7 @@ def workspace_show(
     table.add_row("mode", workspace.mode)
     table.add_row("pacing", workspace.pacing)
     table.add_row("output_dir", str(workspace.output_dir))
-    table.add_row("orchestrator", workspace.models.get("orchestrator", ""))
-    table.add_row("specialist", workspace.models.get("specialist", ""))
+    table.add_row("model", workspace.models.get("primary", ""))
     table.add_row("created_at", workspace.created_at)
     console.print(table)
 

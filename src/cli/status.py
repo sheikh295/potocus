@@ -33,8 +33,7 @@ def status(
         "workspace": None,
         "session": None,
         "models": {
-            "orchestrator": endpoints.orchestrator,
-            "specialist": endpoints.specialist,
+            "primary": endpoints.primary,
             "base_url": endpoints.base_url,
         },
     }
@@ -120,7 +119,6 @@ def status(
         table.add_row("phase", str(sess.get("phase", "—")))
         table.add_row("session status", str(sess.get("status", "—")))
 
-    table.add_row("orchestrator", endpoints.orchestrator)
-    table.add_row("specialist", endpoints.specialist)
+    table.add_row("model", endpoints.primary)
     table.add_row("ollama", endpoints.base_url)
     console.print(table)

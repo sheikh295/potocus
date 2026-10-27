@@ -9,7 +9,7 @@ from typing import Any
 from openai import OpenAI
 
 from src.models import get_model_endpoints, get_openai_client
-from src.prompts import SPECIALIST_SYSTEM_PROMPT
+from src.prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger("potocus.expert")
 
@@ -144,7 +144,8 @@ def consult_security_expert(
     """
     endpoints = get_model_endpoints()
     if budget is None:
-        budget = SpecialistBudget(max_calls_per_turn=endpoints.specialist_calls_per_turn)
+        # Single model: one-shot budget of 1 for the standalone consult command.
+        budget = SpecialistBudget(max_calls_per_turn=1)
 
     if not budget.try_consume():
         notice = (
@@ -159,21 +160,21 @@ def consult_security_expert(
             )
         return ConsultResult(
             answer=notice,
-            model=model or endpoints.specialist,
+            model=model or endpoints.primary,
             capped=True,
             calls_this_turn=budget.calls_this_turn,
             max_calls_per_turn=budget.max_calls_per_turn,
             query=query,
         )
 
-    resolved_model = model or endpoints.specialist
+    resolved_model = model or endpoints.primary
     resolved_temp = endpoints.temperature if temperature is None else temperature
     api = client or get_openai_client()
     user_payload = _build_user_payload(query, context)
 
     # Fresh specialist thread every call — never mix orchestrator history (§19).
     messages = [
-        {"role": "system", "content": SPECIALIST_SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_payload},
     ]
 
@@ -207,6 +208,9 @@ def consult_security_expert(
 
 
 def new_budget_from_config() -> SpecialistBudget:
-    """Create a ``SpecialistBudget`` using ``config.yaml`` limits."""
-    endpoints = get_model_endpoints()
-    return SpecialistBudget(max_calls_per_turn=endpoints.specialist_calls_per_turn)
+    """Create a ``SpecialistBudget`` using ``config.yaml`` limits.
+
+    Potocus now uses a single model, so this is a one-shot budget of 1 for the
+    standalone ``consult_security_expert`` CLI command.
+    """
+    return SpecialistBudget(max_calls_per_turn=1)

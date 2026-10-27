@@ -13,35 +13,32 @@ from src.utils.config import load_global_config
 
 @dataclass(frozen=True)
 class ModelEndpoints:
-    """Resolved model + endpoint configuration."""
+    """Resolved model + endpoint configuration (single security-expert model)."""
 
     base_url: str
     native_url: str
-    orchestrator: str
-    specialist: str
+    primary: str
     temperature: float
     timeout_seconds: float
-    specialist_calls_per_turn: int
+    context_window: int
 
 
 def get_model_endpoints() -> ModelEndpoints:
-    """Load model endpoints from global config (with env overrides)."""
+    """Load model endpoints from global config (with env overrides).
+
+    Potocus now uses a single security-expert model (``models.primary``)
+    instead of a dual orchestrator/specialist pair.
+    """
     cfg = load_global_config()
     ollama = cfg.get("ollama", {})
     models = cfg.get("models", {})
     return ModelEndpoints(
         base_url=str(ollama.get("base_url", "http://127.0.0.1:11434/v1")).rstrip("/"),
         native_url=str(ollama.get("native_url", "http://127.0.0.1:11434")).rstrip("/"),
-        orchestrator=str(models.get("orchestrator", "qwen3:8b")),
-        specialist=str(
-            models.get(
-                "specialist",
-                "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q4_K_M",
-            )
-        ),
+        primary=str(models.get("primary", "hf.co/mradermacher/Cyber-Ornith-1.5-9B-OBLITERATED-GGUF:Q3_K_S")),
         temperature=float(models.get("temperature", 0.2)),
         timeout_seconds=float(ollama.get("timeout_seconds", 120)),
-        specialist_calls_per_turn=int(models.get("specialist_calls_per_turn", 1)),
+        context_window=int(models.get("context_window", 0)),
     )
 
 
@@ -75,26 +72,37 @@ def list_local_models() -> list[str]:
     return names
 
 
+def list_local_models_detail() -> list[dict[str, Any]]:
+    """List full model detail dicts from Ollama ``/api/tags`` (name, capabilities, context_length)."""
+    endpoints = get_model_endpoints()
+    url = f"{endpoints.native_url}/api/tags"
+    with httpx.Client(timeout=endpoints.timeout_seconds) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        payload: dict[str, Any] = response.json()
+    return payload.get("models") or []
+
+
 @dataclass(frozen=True)
 class ConnectionTestResult:
-    """Result of an Ollama connectivity + model availability check."""
+    """Result of an Ollama connectivity + model availability check (single model)."""
 
     ok: bool
     native_url: str
     base_url: str
     available_models: list[str]
-    orchestrator_present: bool
-    specialist_present: bool
+    primary_present: bool
     chat_ok: bool
     chat_preview: str
+    context_window: int
     error: str | None = None
 
 
 def test_ollama_connection(*, run_chat_probe: bool = True) -> ConnectionTestResult:
     """
-    Verify Ollama is reachable and both configured models are available.
+    Verify Ollama is reachable and the configured primary model is available.
 
-    Optionally sends a tiny chat completion to the orchestrator to confirm
+    Optionally sends a tiny chat completion to the primary model to confirm
     the OpenAI-compatible endpoint works end-to-end.
     """
     endpoints = get_model_endpoints()
@@ -106,27 +114,34 @@ def test_ollama_connection(*, run_chat_probe: bool = True) -> ConnectionTestResu
             native_url=endpoints.native_url,
             base_url=endpoints.base_url,
             available_models=[],
-            orchestrator_present=False,
-            specialist_present=False,
+            primary_present=False,
             chat_ok=False,
             chat_preview="",
+            context_window=0,
             error=f"Failed to reach Ollama at {endpoints.native_url}: {exc}",
         )
 
-    orch_ok = endpoints.orchestrator in available
-    spec_ok = endpoints.specialist in available
+    primary_ok = endpoints.primary in available
+
+    # Probe Ollama /api/tags details for the advertised context window of the primary model.
+    context_window = endpoints.context_window
+    try:
+        for detail in list_local_models_detail():
+            if isinstance(detail, dict) and str(detail.get("name")) == endpoints.primary:
+                context_window = int(detail.get("details", {}).get("context_length", 0) or 0)
+                break
+    except Exception:  # noqa: BLE001
+        pass
 
     chat_ok = False
     chat_preview = ""
     error: str | None = None
 
-    if run_chat_probe and orch_ok:
+    if run_chat_probe and primary_ok:
         try:
             client = get_openai_client()
-            # Qwen3 may spend tokens on a `reasoning` channel before content;
-            # give it enough headroom and prefer think=False when the backend supports it.
             completion = client.chat.completions.create(
-                model=endpoints.orchestrator,
+                model=endpoints.primary,
                 messages=[
                     {
                         "role": "user",
@@ -147,17 +162,12 @@ def test_ollama_connection(*, run_chat_probe: bool = True) -> ConnectionTestResu
                 error = "Chat probe returned empty content"
         except Exception as exc:  # noqa: BLE001
             error = f"Chat probe failed: {exc}"
-    elif run_chat_probe and not orch_ok:
-        error = f"Orchestrator model not found: {endpoints.orchestrator}"
+    elif run_chat_probe and not primary_ok:
+        error = f"Primary model not found: {endpoints.primary}"
 
-    ok = orch_ok and spec_ok and (chat_ok if run_chat_probe else True) and error is None
-    if not orch_ok or not spec_ok:
-        missing = []
-        if not orch_ok:
-            missing.append(f"orchestrator={endpoints.orchestrator}")
-        if not spec_ok:
-            missing.append(f"specialist={endpoints.specialist}")
-        error = (error + "; " if error else "") + "Missing models: " + ", ".join(missing)
+    ok = primary_ok and (chat_ok if run_chat_probe else True) and error is None
+    if not primary_ok:
+        error = (error + "; " if error else "") + f"Missing model: primary={endpoints.primary}"
     elif run_chat_probe and not chat_ok and not error:
         error = "Chat probe failed with empty response"
 
@@ -166,9 +176,9 @@ def test_ollama_connection(*, run_chat_probe: bool = True) -> ConnectionTestResu
         native_url=endpoints.native_url,
         base_url=endpoints.base_url,
         available_models=available,
-        orchestrator_present=orch_ok,
-        specialist_present=spec_ok,
+        primary_present=primary_ok,
         chat_ok=chat_ok,
         chat_preview=chat_preview,
+        context_window=context_window,
         error=error,
     )

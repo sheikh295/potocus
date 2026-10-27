@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import pty
+import select
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +33,7 @@ TOOL_NAME = "execute_kali_command"
 
 HitlDecision = Literal["approve", "deny"]
 HitlCallback = Callable[[dict[str, Any]], HitlDecision]
+OutputSink = Callable[[str, bool], None]  # (line, is_stderr)
 
 
 class CommandBlockedError(Exception):
@@ -94,6 +99,14 @@ def parse_command(command: str | list[str]) -> list[str]:
         argv = shlex.split(command, posix=True)
     if not argv:
         raise ValueError(f"{TOOL_NAME} requires a non-empty command")
+
+    # Privilege escalation normalization: `sudo su` (interactive root shell) is
+    # rewritten to `sudo -i` (login root shell) so a spawned sub-terminal behaves
+    # consistently whether or not the parent was already elevated.
+    if len(argv) >= 2 and argv[0] == "sudo" and argv[1] == "su":
+        logger.info("rewriting 'sudo su' → 'sudo -i'")
+        argv = ["sudo", "-i"] + argv[2:]
+
     return argv
 
 
@@ -147,6 +160,7 @@ def execute_kali_command(
     hitl: HitlCallback | None = None,
     on_targets_seen: Callable[[list[str]], None] | None = None,
     on_tier2_confirmed: Callable[[], None] | None = None,
+    on_output: OutputSink | None = None,
 ) -> ExecutionResult:
     """
     Gate and execute a host command for the agent.
@@ -285,27 +299,108 @@ def execute_kali_command(
             message=f"background process started; output → {log_path} | {pacing_note}",
         )
 
+    # Foreground execution with a live pseudo-terminal so output streams while
+    # the command runs (stdout+stderr are merged on the pty, as in a real terminal).
+    stdout_parts: list[str] = []
+    exit_code: int | None = None
+    timed_out = False
+    raw_path: str | None = None
+
+    def _emit(line: str, is_stderr: bool) -> None:
+        if on_output is not None:
+            try:
+                on_output(line, is_stderr)
+            except Exception:  # noqa: BLE001 — UI must never break execution
+                logger.debug("output sink failed", exc_info=True)
+
+    master_fd, slave_fd = pty.openpty()
     try:
-        completed = subprocess.run(  # noqa: S603 — argv list, shell=False
+        proc = subprocess.Popen(  # noqa: S603 — argv list, shell=False
             argv,
             shell=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
+    finally:
+        os.close(slave_fd)
+
+    read_buf = ""
+    lock = threading.Lock()
+    stop_reader = threading.Event()
+
+    def _reader() -> None:
+        nonlocal read_buf, exit_code
+        while not stop_reader.is_set():
+            ready, _, _ = select.select([master_fd], [], [], 0.2)
+            if not ready:
+                if proc.poll() is not None:
+                    # Drain any remaining bytes after exit.
+                    try:
+                        while True:
+                            data = os.read(master_fd, 4096)
+                            if not data:
+                                break
+                            text = data.decode("utf-8", errors="replace")
+                            with lock:
+                                read_buf += text
+                    except OSError:
+                        pass
+                    break
+                continue
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            text = data.decode("utf-8", errors="replace")
+            with lock:
+                read_buf += text
+            while "\n" in read_buf:
+                line, read_buf = read_buf.split("\n", 1)
+                line = scrub_secrets(line)
+                _emit(line + "\n", False)
+                with lock:
+                    stdout_parts.append(line + "\n")
+        # Flush any trailing partial line.
+        with lock:
+            if read_buf.strip():
+                line = scrub_secrets(read_buf)
+                _emit(line, False)
+                stdout_parts.append(line)
+        try:
+            proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        exit_code = proc.returncode
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+    reader.join(timeout=5)
+
+    full_stdout = "".join(stdout_parts)
+
+    if timed_out:
         raw_path = _write_raw_output(
             raw_output_dir,
             argv=argv,
-            stdout=stdout,
-            stderr=stderr or f"timed out after {timeout_seconds}s",
+            stdout=full_stdout,
+            stderr=f"timed out after {timeout_seconds}s",
             exit_code=None,
             status="timeout",
         )
@@ -317,62 +412,37 @@ def execute_kali_command(
             tier=classification.tier,
             tier_reason=classification.reason,
             scope=scope,
-            stdout=stdout,
-            stderr=stderr or f"timed out after {timeout_seconds}s",
+            stdout=full_stdout,
+            stderr=f"timed out after {timeout_seconds}s",
             raw_output_path=str(raw_path),
             message=(
                 f"command timed out after {timeout_seconds}s — try a narrower scan "
                 f"or raise timeout_seconds | {pacing_note}"
             ),
         )
-    except FileNotFoundError:
-        _mark_seen()
-        logger.error("command not found: %s", argv[0])
-        return ExecutionResult(
-            status="error",
-            command=argv,
-            tier=classification.tier,
-            tier_reason=classification.reason,
-            scope=scope,
-            message=(
-                f"command not found: {argv[0]} — not installed on this host "
-                f"(expected on Kali). Self-correct with search_kali_tools or "
-                f"a different binary. | {pacing_note}"
-            ),
-        )
-    except OSError as exc:
-        _mark_seen()
-        logger.error("execution OSError cmd=%s err=%s", argv, exc)
-        return ExecutionResult(
-            status="error",
-            command=argv,
-            tier=classification.tier,
-            tier_reason=classification.reason,
-            scope=scope,
-            message=f"execution error: {exc} | {pacing_note}",
-        )
 
+    # Write the complete (scrubbed) raw output for audit.
     raw_path = _write_raw_output(
         raw_output_dir,
         argv=argv,
-        stdout=completed.stdout or "",
-        stderr=completed.stderr or "",
-        exit_code=completed.returncode,
-        status="ok" if completed.returncode == 0 else "error",
+        stdout=full_stdout,
+        stderr="",
+        exit_code=exit_code,
+        status="ok" if exit_code == 0 else "error",
     )
     _mark_seen()
 
-    status: Literal["ok", "error"] = "ok" if completed.returncode == 0 else "error"
+    status: Literal["ok", "error"] = "ok" if exit_code == 0 else "error"
     logger.info(
         "executed status=%s code=%s cmd=%s raw=%s pacing=%s",
         status,
-        completed.returncode,
+        exit_code,
         argv,
         raw_path,
         paced.profile,
     )
     hint = ""
-    if status == "error" and (completed.stderr or "").strip():
+    if status == "error":
         hint = " — inspect stderr and adjust flags; output was archived for audit"
     return ExecutionResult(
         status=status,
@@ -380,9 +450,9 @@ def execute_kali_command(
         tier=classification.tier,
         tier_reason=classification.reason,
         scope=scope,
-        stdout=completed.stdout or "",
-        stderr=completed.stderr or "",
-        exit_code=completed.returncode,
+        stdout=full_stdout,
+        stderr="",
+        exit_code=exit_code,
         raw_output_path=str(raw_path),
         message=f"{pacing_note}{hint}",
     )

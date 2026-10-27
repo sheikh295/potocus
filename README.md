@@ -1,8 +1,8 @@
 # Potocus
 
-Local-first hybrid AI agent harness for authorized offensive security operations.
+Local-first AI agent harness for authorized offensive security operations.
 
-- **Brain:** Ollama on macOS (Qwen3 orchestrator + Dolphin3-Cyber specialist)
+- **Brain:** Ollama on macOS (Cyber-Ornith single security-expert model)
 - **Hands:** Python harness (built on Mac, **runtime target = Kali Linux**)
 - **Control:** code-level scope enforcement + HITL risk tiers (not prompt trust)
 
@@ -46,8 +46,7 @@ cp .env.example .env   # optional
 
 ```bash
 ollama list
-# qwen3:8b
-# hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q4_K_M
+# hf.co/mradermacher/Cyber-Ornith-1.5-9B-OBLITERATED-GGUF:Q3_K_S
 ```
 
 ## Quick start

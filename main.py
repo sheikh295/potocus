@@ -42,7 +42,7 @@ app.add_typer(config_cmd.app, name="config")
 @app.command("version")
 def version() -> None:
     """Print the Potocus version."""
-    console.print("potocus 0.1.0")
+    console.print("potocus 0.1.4")
 
 
 def main() -> None:

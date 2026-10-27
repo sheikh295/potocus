@@ -28,10 +28,8 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import Command
 
 from src.models import get_model_endpoints
-from src.prompts import ORCHESTRATOR_SYSTEM_PROMPT
+from src.prompts import SYSTEM_PROMPT
 from src.tools.expert import (
-    TOOL_NAME as CONSULT_TOOL_NAME,
-    SpecialistBudget,
     consult_security_expert,
 )
 from src.memory.findings_db import FindingsDB
@@ -60,7 +58,6 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages]
     phase: str
     context_tokens_approx: int
-    specialist_calls_this_turn: int
     workspace_root: str
     session_id: str
     seen_targets: list[str]
@@ -74,9 +71,7 @@ class GraphRuntime:
     workspace: Workspace
     session_id: str
     phase: str
-    orchestrator_model: str
-    specialist_model: str
-    budget: SpecialistBudget
+    model: str
     scope_guard: ScopeGuard
     vectorstore: WorkspaceVectorStore
     findings_db: FindingsDB
@@ -84,8 +79,7 @@ class GraphRuntime:
     tier2_confirmed: bool = False
     pacing_override: str | None = None
     target_focus: str = ""
-    context_token_limit: int = 200000
-    keep_recent_messages: int = 8
+    context_token_limit: int = 64000
     command_timeout_seconds: float = 120.0
     event_sink: Callable[[dict[str, Any]], None] | None = None
     _db_conn: sqlite3.Connection | None = field(default=None, repr=False)
@@ -139,7 +133,7 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
     """Compose the orchestrator system prompt with live workspace/phase context."""
     ws = runtime.workspace
     return (
-        f"{ORCHESTRATOR_SYSTEM_PROMPT}\n\n"
+        f"{SYSTEM_PROMPT}\n\n"
         f"Workspace: {ws.name}\n"
         f"Mode: {ws.mode}\n"
         f"Phase: {phase}\n"
@@ -153,8 +147,6 @@ def _build_system_prompt(runtime: GraphRuntime, phase: str) -> str:
         "flags when available (e.g. nmap -oX -).\n"
         f"- search_past_engagements: query this workspace's findings.db for hosts/"
         "services/prior notes.\n"
-        f"- {CONSULT_TOOL_NAME}: deep CVE/exploit analysis via the specialist "
-        f"(at most {runtime.budget.max_calls_per_turn} call(s) per reasoning step).\n"
         "Typical flow: search tools → format command → execute → rely on structured "
         "extract in the tool result. Do not invent tool results. "
         "Never ask the operator to bypass scope or HITL."
@@ -248,36 +240,6 @@ def _make_llm(model: str, temperature: float, *, think: bool = False) -> OllamaC
 def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
     """Build the tool set available to the orchestrator for this session."""
 
-    @tool(CONSULT_TOOL_NAME)
-    def consult_security_expert_tool(query: str, context: str = "") -> str:
-        """
-        Consult the offensive-security specialist (Dolphin3-Cyber) for deep CVE
-        analysis, exploit reasoning, or specialized red-team questions.
-
-        Args:
-            query: The specialist question.
-            context: Optional factual context (scan notes, CVE ids, host data).
-        """
-        result = consult_security_expert(
-            query,
-            context=context or None,
-            budget=runtime.budget,
-            model=runtime.specialist_model,
-        )
-        logger.info(
-            "%s capped=%s calls=%s/%s",
-            CONSULT_TOOL_NAME,
-            result.capped,
-            result.calls_this_turn,
-            result.max_calls_per_turn,
-        )
-        if result.capped:
-            return (
-                f"BUDGET_EXCEEDED: {result.answer} "
-                "Do not call this tool again in the same reasoning step."
-            )
-        return result.answer
-
     @tool(EXECUTE_TOOL_NAME)
     def execute_kali_command_tool(
         command: str,
@@ -322,6 +284,14 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
             pacing=runtime.effective_pacing,
             on_targets_seen=_mark_targets,
             on_tier2_confirmed=_mark_tier2,
+            on_output=lambda line, is_stderr: runtime.emit(
+                {
+                    "type": "terminal_output",
+                    "line": line,
+                    "is_stderr": is_stderr,
+                    "tool": EXECUTE_TOOL_NAME,
+                }
+            ),
         )
         text = result.as_tool_text()
         if result.status in {"ok", "error", "timeout"} and (
@@ -393,7 +363,6 @@ def build_tools(runtime: GraphRuntime) -> list[BaseTool]:
         search_kali_tools_tool,
         execute_kali_command_tool,
         search_past_engagements_tool,
-        consult_security_expert_tool,
         *extra_tools,
     ]
 
@@ -429,19 +398,24 @@ def build_graph(runtime: GraphRuntime) -> Any:
         return result
 
     def compact_node(state: AgentState) -> dict[str, Any]:
-        """Proactively summarize older turns before hitting the context ceiling."""
+        """Compact context only when the app-level cap is reached (one summary, not per turn)."""
         runtime.emit({"type": "node", "node": "compact"})
         messages = list(state.get("messages") or [])
         tokens = estimate_tokens(messages)
         limit = runtime.context_token_limit
-        if tokens < limit or len(messages) <= runtime.keep_recent_messages + 1:
-            runtime.emit({"type": "status", "text": "context within budget — skip compact"})
+        if tokens < limit:
+            runtime.emit({"type": "status", "text": "context within cap — skip compact"})
             return {"context_tokens_approx": tokens}
-        runtime.emit({"type": "status", "text": "context high — summarizing older turns"})
 
-        keep = runtime.keep_recent_messages
-        older = messages[:-keep] if keep < len(messages) else messages[:1]
-        recent = messages[-keep:] if keep < len(messages) else messages[1:]
+        runtime.emit({"type": "status", "text": "context cap reached — summarizing once"})
+
+        # Keep the current user turn verbatim; summarize everything older.
+        current_user = None
+        older = list(messages)
+        for i in range(len(older) - 1, -1, -1):
+            if getattr(older[i], "type", "") == "human":
+                current_user = older.pop(i)
+                break
 
         digest_source = []
         for msg in older:
@@ -449,9 +423,10 @@ def build_graph(runtime: GraphRuntime) -> Any:
             content = getattr(msg, "content", "")
             if isinstance(content, str) and content.strip():
                 digest_source.append(f"{role}: {content[:800]}")
-        digest_blob = "\n".join(digest_source)[:6000]
+        digest_blob = "\n".join(digest_source)[:6000] or "(empty)"
 
-        summarizer = _make_llm(runtime.orchestrator_model, endpoints.temperature)
+        summarizer = _make_llm(runtime.model, endpoints.temperature, think=False)
+        phase = str(state.get("phase") or runtime.phase)
         summary = summarizer.invoke(
             [
                 SystemMessage(
@@ -460,7 +435,7 @@ def build_graph(runtime: GraphRuntime) -> Any:
                         "agent. Keep facts, hosts, findings, and decisions. Drop fluff."
                     )
                 ),
-                HumanMessage(content=digest_blob or "(empty)"),
+                HumanMessage(content=digest_blob),
             ]
         )
         summary_text = (
@@ -469,15 +444,19 @@ def build_graph(runtime: GraphRuntime) -> Any:
             else str(summary.content)
         )
         compacted: list[BaseMessage] = [
+            SystemMessage(
+                content=_build_system_prompt(runtime, phase)
+            ),
             HumanMessage(
                 content=f"[context_compacted]\n{summary_text}",
                 name="potocus_compactor",
             ),
-            *recent,
         ]
+        if current_user is not None:
+            compacted.append(current_user)
         new_tokens = estimate_tokens(compacted)
         logger.info(
-            "context compacted %s → %s tokens (%s messages kept)",
+            "context compacted %s → %s tokens (%s messages)",
             tokens,
             new_tokens,
             len(compacted),
@@ -490,7 +469,6 @@ def build_graph(runtime: GraphRuntime) -> Any:
     def agent_node(state: AgentState) -> dict[str, Any]:
         """One orchestrator reasoning step (may request tools)."""
         runtime.emit({"type": "node", "node": "agent"})
-        runtime.budget.reset_turn()
         phase = str(state.get("phase") or runtime.phase)
         runtime.phase = phase
         # Union checkpointed gates with anything tools mutated on the runtime.
@@ -503,7 +481,7 @@ def build_graph(runtime: GraphRuntime) -> Any:
         # Verbose CLI: stream + think tokens. Quiet/tests: plain invoke.
         want_stream = runtime.event_sink is not None
         llm = _make_llm(
-            runtime.orchestrator_model,
+            runtime.model,
             endpoints.temperature,
             think=want_stream,
         ).bind_tools(tools)
@@ -572,7 +550,7 @@ def build_graph(runtime: GraphRuntime) -> Any:
         ):
             runtime.emit({"type": "status", "text": "empty think reply — retrying quiet"})
             quiet = _make_llm(
-                runtime.orchestrator_model,
+                runtime.model,
                 endpoints.temperature,
                 think=False,
             ).bind_tools(tools)
@@ -592,7 +570,6 @@ def build_graph(runtime: GraphRuntime) -> Any:
         all_for_estimate = prior + [response]
         return {
             "messages": [response],
-            "specialist_calls_this_turn": runtime.budget.calls_this_turn,
             "context_tokens_approx": estimate_tokens(all_for_estimate),
             "phase": phase,
             "seen_targets": list(runtime.seen_targets),
@@ -661,7 +638,6 @@ class PotocusAgent:
             "phase": self.runtime.phase,
             "workspace_root": str(self.runtime.workspace.root),
             "session_id": self.runtime.session_id,
-            "specialist_calls_this_turn": 0,
             "seen_targets": list(self.runtime.seen_targets),
             "tier2_confirmed": self.runtime.tier2_confirmed,
         }
@@ -761,7 +737,6 @@ def create_agent(
         if context_token_limit is not None
         else int(agent_cfg.get("context_token_limit", 8000))
     )
-    keep_recent = int(agent_cfg.get("keep_recent_messages", 8))
     cmd_timeout = float(agent_cfg.get("command_timeout_seconds", 120))
 
     scope_guard = ScopeGuard.from_workspace(
@@ -775,9 +750,7 @@ def create_agent(
         workspace=workspace,
         session_id=session_id,
         phase=str(resolved_phase),
-        orchestrator_model=workspace.models.get("orchestrator") or endpoints.orchestrator,
-        specialist_model=workspace.models.get("specialist") or endpoints.specialist,
-        budget=SpecialistBudget(max_calls_per_turn=endpoints.specialist_calls_per_turn),
+        model=workspace.models.get("primary") or endpoints.primary,
         scope_guard=scope_guard,
         vectorstore=vectorstore,
         findings_db=findings_db,
@@ -790,7 +763,6 @@ def create_agent(
             else str(session_meta.get("target_focus") or "")
         ),
         context_token_limit=limit,
-        keep_recent_messages=keep_recent,
         command_timeout_seconds=cmd_timeout,
     )
     compiled = build_graph(runtime)

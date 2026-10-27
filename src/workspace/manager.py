@@ -166,10 +166,9 @@ def init_workspace(
         "pacing": resolved_pacing,
         "created_at": created_at,
         "models": {
-            "orchestrator": models_cfg.get("orchestrator", "qwen3:8b"),
-            "specialist": models_cfg.get(
-                "specialist",
-                "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q4_K_M",
+            "primary": models_cfg.get(
+                "primary",
+                "hf.co/mradermacher/Cyber-Ornith-1.5-9B-OBLITERATED-GGUF:Q3_K_S",
             ),
         },
     }

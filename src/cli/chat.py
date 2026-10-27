@@ -16,7 +16,6 @@ from rich.prompt import Prompt
 from src.cli.chat_ui import ActivityDisplay, render_stream_event
 from src.graph import PotocusAgent, create_agent, valid_phases
 from src.tools.discovery import TOOL_NAME as SEARCH_TOOLS_NAME
-from src.tools.expert import TOOL_NAME as CONSULT_TOOL_NAME
 from src.tools.terminal import TOOL_NAME as EXECUTE_TOOL_NAME
 from src.utils.config import (
     GLOBAL_STATE_DIR,
@@ -202,9 +201,8 @@ def chat(ctx: typer.Context) -> None:
             f"phase: {phase}  ·  focus: {agent.runtime.target_focus or '(none)'}\n"
             f"pacing: {agent.runtime.effective_pacing}\n"
             f"checkpoint messages: {prior_msgs}\n"
-            f"orchestrator: {agent.runtime.orchestrator_model}\n"
-            f"specialist:   {agent.runtime.specialist_model}\n"
-            f"tools: {SEARCH_TOOLS_NAME}, {EXECUTE_TOOL_NAME}, {CONSULT_TOOL_NAME}\n"
+            f"model: {agent.runtime.model}\n"
+            f"tools: {SEARCH_TOOLS_NAME}, {EXECUTE_TOOL_NAME}, search_past_engagements\n"
             f"context budget: {agent.runtime.context_token_limit} tokens (approx)\n"
             "[dim]Commands: /exit  /status  /phase <NAME>[/dim]",
             title="Potocus Chat (LangGraph)",
@@ -237,9 +235,6 @@ def chat(ctx: typer.Context) -> None:
                 console.print(
                     f"mode={workspace.mode} phase={agent.runtime.phase} "
                     f"tokens≈{values.get('context_tokens_approx', 0)} "
-                    f"specialist_this_turn="
-                    f"{values.get('specialist_calls_this_turn', 0)}/"
-                    f"{agent.runtime.budget.max_calls_per_turn} "
                     f"tier2_confirmed={agent.runtime.tier2_confirmed} "
                     f"seen_targets={agent.runtime.seen_targets} "
                     f"messages={len(values.get('messages') or [])}"
